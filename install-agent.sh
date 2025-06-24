@@ -14,8 +14,8 @@ KEY_FILE_PATH="${CONFIG_DIR}/agent-key.json"
 CONFIG_FILE_PATH="${CONFIG_DIR}/agent.conf"
 
 # The URLs for the cloud functions
-CLAIM_URL="https://europe-west3-noirnote.cloudfunctions.net/claimAgentToken" # Corrected region
-INGEST_URL="https://europe-west3-noirnote.cloudfunctions.net/ingestMetrics" # Corrected region
+CLAIM_URL="https://europe-west3-noirnote.cloudfunctions.net/claimAgentToken"
+INGEST_URL="https://europe-west3-noirnote.cloudfunctions.net/ingestMetrics"
 
 # --- Helper Functions ---
 function check_root() {
@@ -56,17 +56,108 @@ function setup_agent_user_and_dirs() {
 
 function create_agent_script() {
     echo "--> [3/5] Creating agent script at ${AGENT_SCRIPT_PATH}..."
+    # The agent code is embedded here using a "heredoc".
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
-# PASTE THE ENTIRE CORRECTED noirnote_agent.py SCRIPT HERE
+# agent/noirnote_agent.py
+import psutil
+import requests
+import json
+import time
+import os
+from google.oauth2 import service_account
+import google.auth.transport.requests
+
+# --- Configuration ---
+CONFIG_FILE_PATH = "/etc/noirnote/agent.conf"
+KEY_FILE_PATH = "/etc/noirnote/agent-key.json"
+
+def load_config():
+    """Loads agent configuration from the config file."""
+    config = {}
+    if not os.path.exists(CONFIG_FILE_PATH):
+        print(f"FATAL: Config file not found at '{CONFIG_FILE_PATH}'")
+        raise FileNotFoundError
+    with open(CONFIG_FILE_PATH, 'r') as f:
+        for line in f:
+            if '=' in line:
+                key, value = line.strip().split('=', 1)
+                config[key.strip()] = value.strip()
+    return config
+
+def get_authenticated_session(key_path, target_audience):
+    """
+    Creates credentials that can be used to invoke a secured Cloud Function.
+    """
+    try:
+        creds = service_account.IDTokenCredentials.from_service_account_file(
+            key_path,
+            target_audience=target_audience
+        )
+        return creds
+    except FileNotFoundError:
+        print(f"FATAL: Service account key file not found at '{key_path}'.")
+        raise
+    except Exception as e:
+        print(f"FATAL: Could not create authenticated session. Error: {e}")
+        raise
+
+def collect_metrics():
+    """Gathers system metrics using psutil."""
+    return {
+        "cpu_percent": psutil.cpu_percent(interval=1),
+        "memory_percent": psutil.virtual_memory().percent,
+        "disk_percent": psutil.disk_usage('/').percent
+    }
+
+if __name__ == "__main__":
+    print("Starting NoirNote Metrics Agent...")
+    try:
+        config = load_config()
+        credentials = get_authenticated_session(KEY_FILE_PATH, config['INGEST_FUNCTION_URL'])
+    except Exception as e:
+        exit(1)
+        
+    print(f"Agent configured for server_id: {config.get('SERVER_ID', 'UNKNOWN')} reporting for user: {config.get('USER_UID', 'UNKNOWN')}")
+    
+    # Create a transport request object to handle token refreshes automatically.
+    authed_session = google.auth.transport.requests.Request()
+
+    while True:
+        try:
+            metrics = collect_metrics()
+            
+            payload = {
+                "server_id": config['SERVER_ID'],
+                "user_uid": config['USER_UID'],
+                "metrics": metrics
+            }
+            
+            # Refresh the token if it's about to expire
+            credentials.refresh(authed_session)
+            
+            headers = {
+                'Authorization': f'Bearer {credentials.token}',
+                'Content-Type': 'application/json'
+            }
+            
+            print(f"Pushing metrics: {payload}")
+            response = requests.post(config['INGEST_FUNCTION_URL'], json=payload, headers=headers, timeout=15)
+            
+            response.raise_for_status()
+            print(f"Successfully pushed metrics. Status: {response.status_code}")
+
+        except Exception as e:
+            print(f"ERROR: Failed to collect or push metrics: {e}")
+        
+        time.sleep(int(config.get('INTERVAL_SECONDS', 60)))
 AGENT_EOF
     chown "$AGENT_USER":"$AGENT_USER" "$AGENT_SCRIPT_PATH"
     chmod 750 "$AGENT_SCRIPT_PATH"
 }
 
 function configure_agent() {
-    echo "--> [4/5] Claiming credentials and configuring agent..."
+    echo "--> [4/5] Configuring agent..."
     
-    # This loop correctly parses "--token=VALUE"
     TOKEN=""
     for arg in "$@"; do
         case $arg in
@@ -77,13 +168,19 @@ function configure_agent() {
         esac
     done
 
+    # If config files already exist AND no new token was provided, skip this step.
+    if [ -f "$CONFIG_FILE_PATH" ] && [ -f "$KEY_FILE_PATH" ] && [ -z "$TOKEN" ]; then
+        echo "    - Configuration files already exist. Skipping credential claim."
+        return
+    fi
+    
+    # If we are here, we either need to configure for the first time or re-configure.
     if [ -z "$TOKEN" ]; then
-        echo "    [ERROR] --token flag is missing. Installation cannot proceed."
+        echo "    [ERROR] --token flag is required for initial configuration."
         exit 1
     fi
-    echo "    - Using one-time token..."
 
-    # Call the claimAgentToken function
+    echo "    - Using one-time token to claim credentials..."
     RESPONSE_JSON=$(curl -s -X POST -H "Content-Type: application/json" \
         -d "{\"token\": \"$TOKEN\"}" \
         "$CLAIM_URL")
@@ -158,5 +255,5 @@ check_root
 install_dependencies
 setup_agent_user_and_dirs
 create_agent_script
-configure_agent "$@" # This will now work correctly
+configure_agent "$@"
 setup_service
