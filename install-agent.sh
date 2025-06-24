@@ -2,7 +2,7 @@
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-echo "--- NoirNote Agent Installer (Automated v2) ---"
+echo "--- NoirNote Agent Installer (Automated v3 - Final) ---"
 
 # --- Configuration ---
 AGENT_USER="noirnote-agent"
@@ -14,9 +14,8 @@ KEY_FILE_PATH="${CONFIG_DIR}/agent-key.json"
 CONFIG_FILE_PATH="${CONFIG_DIR}/agent.conf"
 
 # The URLs for the cloud functions
-CLAIM_URL="https://us-central1-noirnote.cloudfunctions.net/claimAgentToken"
-INGEST_URL="https://us-central1-noirnote.cloudfunctions.net/ingestMetrics"
-
+CLAIM_URL="https://europe-west3-noirnote.cloudfunctions.net/claimAgentToken" # Corrected region
+INGEST_URL="https://europe-west3-noirnote.cloudfunctions.net/ingestMetrics" # Corrected region
 
 # --- Helper Functions ---
 function check_root() {
@@ -35,7 +34,6 @@ function install_dependencies() {
     apt-get update -y > /dev/null
     apt-get install -y python3 python3-pip curl > /dev/null
     pip3 install --break-system-packages psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 > /dev/null
-
     echo "    - Dependencies installed."
 }
 
@@ -70,7 +68,7 @@ AGENT_EOF
 function configure_agent() {
     echo "--> [4/5] Claiming credentials and configuring agent..."
     
-    # 1. Parse the --token argument
+    # This loop correctly parses "--token=VALUE"
     TOKEN=""
     for arg in "$@"; do
         case $arg in
@@ -87,39 +85,38 @@ function configure_agent() {
     fi
     echo "    - Using one-time token..."
 
-    # 2. Call the claimAgentToken function to get credentials
-    # The response is a JSON object like {"serviceAccountKey": {...}, "userUid": "...", "serverName": "..."}
+    # Call the claimAgentToken function
     RESPONSE_JSON=$(curl -s -X POST -H "Content-Type: application/json" \
         -d "{\"token\": \"$TOKEN\"}" \
         "$CLAIM_URL")
 
-    # 3. Check if the claim was successful and extract data using python3
+    # Check for a valid response
     if [ -z "$RESPONSE_JSON" ] || [[ "$RESPONSE_JSON" != *"private_key"* ]]; then
-        echo "    [ERROR] Failed to claim agent credentials. The token might be invalid, expired, or already used."
+        echo "    [ERROR] Failed to claim agent credentials. Token may be invalid, expired, or used."
         echo "    Server Response: $RESPONSE_JSON"
         exit 1
     fi
 
-    # Extract the values from the JSON response
+    # Extract data using python3 to safely parse the JSON
     SERVICE_ACCOUNT_KEY_JSON=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; data = json.load(sys.stdin); print(json.dumps(data.get('serviceAccountKey'), indent=2)) if data.get('serviceAccountKey') else ''")
     USER_UID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('userUid', ''))")
     SERVER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('serverName', ''))")
     
     if [ -z "$SERVICE_ACCOUNT_KEY_JSON" ] || [ -z "$USER_UID" ] || [ -z "$SERVER_ID" ]; then
-        echo "    [ERROR] Claim response was incomplete. Could not find all required fields (serviceAccountKey, userUid, serverName)."
+        echo "    [ERROR] Claim response was incomplete. Could not find all required fields."
         exit 1
     fi
     
     echo "    - Credentials successfully claimed for server: '$SERVER_ID'"
 
-    # 4. Save the service account key and the configuration file automatically
+    # Save the files
     echo "$SERVICE_ACCOUNT_KEY_JSON" > "$KEY_FILE_PATH"
     chown "$AGENT_USER":"$AGENT_USER" "$KEY_FILE_PATH"
     chmod 400 "$KEY_FILE_PATH"
     echo "    - Service account key saved securely."
 
     echo "SERVER_ID=$SERVER_ID" > "$CONFIG_FILE_PATH"
-    echo "USER_UID=$USER_UID" >> "$CONFIG_FILE_PATH" # Add user UID to config
+    echo "USER_UID=$USER_UID" >> "$CONFIG_FILE_PATH"
     echo "INGEST_FUNCTION_URL=$INGEST_URL" >> "$CONFIG_FILE_PATH"
     echo "INTERVAL_SECONDS=60" >> "$CONFIG_FILE_PATH"
     chown "$AGENT_USER":"$AGENT_USER" "$CONFIG_FILE_PATH"
@@ -163,5 +160,5 @@ check_root
 install_dependencies
 setup_agent_user_and_dirs
 create_agent_script
-configure_agent "$@" # Pass all arguments to the configure function
+configure_agent "$@" # This will now work correctly
 setup_service
