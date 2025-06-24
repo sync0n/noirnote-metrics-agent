@@ -34,7 +34,8 @@ function install_dependencies() {
     fi
     apt-get update -y > /dev/null
     apt-get install -y python3 python3-pip curl > /dev/null
-    pip3 install psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 > /dev/null
+    pip3 install --break-system-packages psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 > /dev/null
+
     echo "    - Dependencies installed."
 }
 
