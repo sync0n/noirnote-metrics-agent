@@ -2,7 +2,7 @@
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-echo "--- NoirNote Agent Installer (Robust Version) ---"
+echo "--- NoirNote Agent Installer (Automated v2) ---"
 
 # --- Configuration ---
 AGENT_USER="noirnote-agent"
@@ -12,7 +12,11 @@ AGENT_SERVICE_FILE="/etc/systemd/system/noirnote-agent.service"
 AGENT_SCRIPT_PATH="${AGENT_DIR}/noirnote_agent.py"
 KEY_FILE_PATH="${CONFIG_DIR}/agent-key.json"
 CONFIG_FILE_PATH="${CONFIG_DIR}/agent.conf"
-FUNCTION_URL="https://us-central1-noirnote.cloudfunctions.net/ingestMetrics"
+
+# The URLs for the cloud functions
+CLAIM_URL="https://us-central1-noirnote.cloudfunctions.net/claimAgentToken"
+INGEST_URL="https://us-central1-noirnote.cloudfunctions.net/ingestMetrics"
+
 
 # --- Helper Functions ---
 function check_root() {
@@ -23,18 +27,15 @@ function check_root() {
 }
 
 function install_dependencies() {
-    echo "--> [1/5] Installing dependencies via apt..."
+    echo "--> [1/5] Installing dependencies..."
     if ! command -v apt-get &> /dev/null; then
-        echo "Error: apt-get not found. This script is designed for Debian-based systems (Debian, Ubuntu)."
+        echo "Error: apt-get not found. This script is for Debian/Ubuntu systems."
         exit 1
     fi
-    
-    # --- THIS IS THE FIX ---
-    # Refresh package list and install the Debian/Ubuntu packaged versions of our dependencies.
-    # This is the correct way to handle PEP 668-protected environments.
-    apt-get update
-    apt-get install -y python3-pip python3-psutil python3-requests python3-google-auth
-    # --- END FIX ---
+    apt-get update -y > /dev/null
+    apt-get install -y python3 python3-pip curl > /dev/null
+    pip3 install psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 > /dev/null
+    echo "    - Dependencies installed."
 }
 
 function setup_agent_user_and_dirs() {
@@ -57,28 +58,68 @@ function setup_agent_user_and_dirs() {
 function create_agent_script() {
     echo "--> [3/5] Creating agent script at ${AGENT_SCRIPT_PATH}..."
     # The agent code will be placed here.
+    # Make sure to paste the updated noirnote_agent.py content here
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
-# PASTE THE ENTIRE, REFINED CONTENT of your noirnote_agent.py SCRIPT HERE
+# PASTE THE ENTIRE UPDATED CONTENT of your noirnote_agent.py SCRIPT HERE
 AGENT_EOF
     chown "$AGENT_USER":"$AGENT_USER" "$AGENT_SCRIPT_PATH"
     chmod 750 "$AGENT_SCRIPT_PATH"
 }
 
 function configure_agent() {
-    echo ""
-    echo "--> [4/5] Configuring agent..."
-    echo "    Please paste the entire content of your service account JSON key file."
-    echo "    Press Enter, then Ctrl+D when you are finished."
-    cat > "$KEY_FILE_PATH"
+    echo "--> [4/5] Claiming credentials and configuring agent..."
+    
+    # 1. Parse the --token argument
+    TOKEN=""
+    for arg in "$@"; do
+        case $arg in
+            --token=*)
+            TOKEN="${arg#*=}"
+            shift
+            ;;
+        esac
+    done
+
+    if [ -z "$TOKEN" ]; then
+        echo "    [ERROR] --token flag is missing. Installation cannot proceed."
+        exit 1
+    fi
+    echo "    - Using one-time token..."
+
+    # 2. Call the claimAgentToken function to get credentials
+    # The response is a JSON object like {"serviceAccountKey": {...}, "userUid": "...", "serverName": "..."}
+    RESPONSE_JSON=$(curl -s -X POST -H "Content-Type: application/json" \
+        -d "{\"token\": \"$TOKEN\"}" \
+        "$CLAIM_URL")
+
+    # 3. Check if the claim was successful and extract data using python3
+    if [ -z "$RESPONSE_JSON" ] || [[ "$RESPONSE_JSON" != *"private_key"* ]]; then
+        echo "    [ERROR] Failed to claim agent credentials. The token might be invalid, expired, or already used."
+        echo "    Server Response: $RESPONSE_JSON"
+        exit 1
+    fi
+
+    # Extract the values from the JSON response
+    SERVICE_ACCOUNT_KEY_JSON=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; data = json.load(sys.stdin); print(json.dumps(data.get('serviceAccountKey'), indent=2)) if data.get('serviceAccountKey') else ''")
+    USER_UID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('userUid', ''))")
+    SERVER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('serverName', ''))")
+    
+    if [ -z "$SERVICE_ACCOUNT_KEY_JSON" ] || [ -z "$USER_UID" ] || [ -z "$SERVER_ID" ]; then
+        echo "    [ERROR] Claim response was incomplete. Could not find all required fields (serviceAccountKey, userUid, serverName)."
+        exit 1
+    fi
+    
+    echo "    - Credentials successfully claimed for server: '$SERVER_ID'"
+
+    # 4. Save the service account key and the configuration file automatically
+    echo "$SERVICE_ACCOUNT_KEY_JSON" > "$KEY_FILE_PATH"
     chown "$AGENT_USER":"$AGENT_USER" "$KEY_FILE_PATH"
-    chmod 400 "$KEY_FILE_PATH" # Make key readable only by the owner.
+    chmod 400 "$KEY_FILE_PATH"
     echo "    - Service account key saved securely."
 
-    echo ""
-    read -p "    Enter a unique name for this server (e.g., web-prod-01): " SERVER_ID
-    
     echo "SERVER_ID=$SERVER_ID" > "$CONFIG_FILE_PATH"
-    echo "INGEST_FUNCTION_URL=$FUNCTION_URL" >> "$CONFIG_FILE_PATH"
+    echo "USER_UID=$USER_UID" >> "$CONFIG_FILE_PATH" # Add user UID to config
+    echo "INGEST_FUNCTION_URL=$INGEST_URL" >> "$CONFIG_FILE_PATH"
     echo "INTERVAL_SECONDS=60" >> "$CONFIG_FILE_PATH"
     chown "$AGENT_USER":"$AGENT_USER" "$CONFIG_FILE_PATH"
     chmod 640 "$CONFIG_FILE_PATH"
@@ -121,5 +162,5 @@ check_root
 install_dependencies
 setup_agent_user_and_dirs
 create_agent_script
-configure_agent
+configure_agent "$@" # Pass all arguments to the configure function
 setup_service
