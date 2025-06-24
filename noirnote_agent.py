@@ -62,13 +62,14 @@ if __name__ == "__main__":
     # Create a transport request object to handle token refreshes automatically.
     authed_session = google.auth.transport.requests.Request()
 
+    # --- START OF FIX: This entire block is now correctly indented ---
     while True:
         try:
             metrics = collect_metrics()
             
             payload = {
                 "server_id": config['SERVER_ID'],
-                "user_uid": config['USER_UID'], # Add this line
+                "user_uid": config['USER_UID'],
                 "metrics": metrics
             }
             
@@ -90,3 +91,4 @@ if __name__ == "__main__":
             print(f"ERROR: Failed to collect or push metrics: {e}")
         
         time.sleep(int(config.get('INTERVAL_SECONDS', 60)))
+    # --- END OF FIX ---

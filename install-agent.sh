@@ -56,10 +56,8 @@ function setup_agent_user_and_dirs() {
 
 function create_agent_script() {
     echo "--> [3/5] Creating agent script at ${AGENT_SCRIPT_PATH}..."
-    # The agent code will be placed here.
-    # Make sure to paste the updated noirnote_agent.py content here
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
-# PASTE THE ENTIRE UPDATED CONTENT of your noirnote_agent.py SCRIPT HERE
+# PASTE THE ENTIRE CORRECTED noirnote_agent.py SCRIPT HERE
 AGENT_EOF
     chown "$AGENT_USER":"$AGENT_USER" "$AGENT_SCRIPT_PATH"
     chmod 750 "$AGENT_SCRIPT_PATH"
