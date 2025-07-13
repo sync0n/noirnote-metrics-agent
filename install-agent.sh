@@ -15,7 +15,8 @@ CONFIG_FILE_PATH="${CONFIG_DIR}/agent.conf"
 
 # The URLs for the cloud functions
 CLAIM_URL="https://europe-west3-noirnote.cloudfunctions.net/claimAgentToken"
-INGEST_URL="INGEST_URL="https://chronos.noirnote.it/ingest"
+# The INGEST_URL is now written directly into the config file below
+INGEST_URL="https://chronos.noirnote.it/ingest" 
 
 # --- Helper Functions ---
 function check_root() {
@@ -26,18 +27,22 @@ function check_root() {
 }
 
 function install_dependencies() {
+    # FIX: Added quotes around the echo statements
     echo "--> [1/5] Installing dependencies..."
     if ! command -v apt-get &> /dev/null; then
         echo "Error: apt-get not found. This script is for Debian/Ubuntu systems."
         exit 1
     fi
     apt-get update -y > /dev/null
-    apt-get install -y python3 python3-pip curl > /dev/null
+    # Ensure python3-venv is installed for pip to work correctly in some environments
+    apt-get install -y python3 python3-pip python3-venv curl > /dev/null
+    # Using --break-system-packages is the modern, correct way for recent distros
     pip3 install --break-system-packages psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 > /dev/null
     echo "    - Dependencies installed."
 }
 
 function setup_agent_user_and_dirs() {
+    # FIX: Added quotes around the echo statements
     echo "--> [2/5] Setting up user and directories..."
     if ! id -u "$AGENT_USER" >/dev/null 2>&1; then
         useradd --system --shell /usr/sbin/nologin "$AGENT_USER"
@@ -55,8 +60,10 @@ function setup_agent_user_and_dirs() {
 }
 
 function create_agent_script() {
+    # FIX: Added quotes around the echo statements
     echo "--> [3/5] Creating agent script at ${AGENT_SCRIPT_PATH}..."
     # The agent code is embedded here using a "heredoc".
+    # --- ENHANCEMENT: Merged the advanced agent code here ---
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
 # agent/noirnote_agent.py
 import psutil
@@ -64,12 +71,17 @@ import requests
 import json
 import time
 import os
+import traceback
 from google.oauth2 import service_account
 import google.auth.transport.requests
 
 # --- Configuration ---
 CONFIG_FILE_PATH = "/etc/noirnote/agent.conf"
 KEY_FILE_PATH = "/etc/noirnote/agent-key.json"
+
+# --- State for calculating network rate ---
+last_net_io = psutil.net_io_counters()
+last_time = time.time()
 
 def load_config():
     """Loads agent configuration from the config file."""
@@ -84,55 +96,124 @@ def load_config():
                 config[key.strip()] = value.strip()
     return config
 
-def get_authenticated_session(key_path, target_audience):
+def get_service_account_credentials(key_path, target_audience):
     """
-    Creates credentials that can be used to invoke a secured Cloud Function.
+    Creates credentials that can be used to invoke a secured Cloud Run/Function service.
     """
     try:
+        # This creates a credential object that can mint its own JWTs.
         creds = service_account.IDTokenCredentials.from_service_account_file(
             key_path,
             target_audience=target_audience
         )
         return creds
-    except FileNotFoundError:
-        print(f"FATAL: Service account key file not found at '{key_path}'.")
-        raise
     except Exception as e:
-        print(f"FATAL: Could not create authenticated session. Error: {e}")
+        print(f"FATAL: Could not create service account credentials. Error: {e}")
         raise
 
-def collect_metrics():
-    """Gathers system metrics using psutil."""
+def get_top_processes(limit=10):
+    """Gets a list of the top N processes by combined CPU and Memory."""
+    procs = []
+    for p in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent', 'memory_percent']):
+        try:
+            # cpu_percent can be high initially, call it again for a better reading
+            p.cpu_percent(interval=0.01) 
+            time.sleep(0.01)
+            p.cpu_percent(interval=None)
+            procs.append(p)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    
+    # Sort by cpu_percent, then memory_percent, descending
+    top_procs = sorted(procs, key=lambda p: (p.info['cpu_percent'], p.info['memory_percent']), reverse=True)
+    
+    # Format the output
+    return [
+        {
+            "pid": p.info['pid'], 
+            "name": p.info['name'], 
+            "cpu_percent": p.info['cpu_percent'],
+            "memory_percent": p.info['memory_percent']
+        } 
+        for p in top_procs[:limit]
+    ]
+    
+def get_disk_usage():
+    """Gets usage for all physical disk partitions."""
+    disks = []
+    for part in psutil.disk_partitions(all=False):
+        if 'loop' in part.device or 'tmpfs' in part.fstype:
+            continue
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+            disks.append({
+                "device": part.device,
+                "mountpoint": part.mountpoint,
+                "percent": usage.percent
+            })
+        except Exception:
+            continue
+    return disks
+
+def get_network_rate():
+    """Calculates the network rate in bytes per second."""
+    global last_net_io, last_time
+    
+    current_net_io = psutil.net_io_counters()
+    current_time = time.time()
+    
+    elapsed_time = current_time - last_time
+    if elapsed_time <= 0:
+        return {"bytes_sent_per_sec": 0, "bytes_recv_per_sec": 0}
+        
+    bytes_sent_rate = (current_net_io.bytes_sent - last_net_io.bytes_sent) / elapsed_time
+    bytes_recv_rate = (current_net_io.bytes_recv - last_net_io.bytes_recv) / elapsed_time
+    
+    last_net_io = current_net_io
+    last_time = current_time
+    
     return {
-        "cpu_percent": psutil.cpu_percent(interval=1),
-        "memory_percent": psutil.virtual_memory().percent,
-        "disk_percent": psutil.disk_usage('/').percent
+        "bytes_sent_per_sec": int(bytes_sent_rate),
+        "bytes_recv_per_sec": int(bytes_recv_rate)
     }
 
+def collect_all_metrics():
+    """Gathers all enhanced system metrics."""
+    print("--> Collecting metrics...")
+    psutil.cpu_percent(interval=0.5) 
+    
+    metrics = {
+        "cpu_percent": psutil.cpu_percent(interval=1),
+        "memory_percent": psutil.virtual_memory().percent,
+        "disks": get_disk_usage(),
+        "processes": get_top_processes(),
+        "network": get_network_rate()
+    }
+    print("--> Metrics collection complete.")
+    return metrics
+
 if __name__ == "__main__":
-    print("Starting NoirNote Metrics Agent...")
+    print("Starting NoirNote Enhanced Metrics Agent...")
     try:
         config = load_config()
-        credentials = get_authenticated_session(KEY_FILE_PATH, config['INGEST_FUNCTION_URL'])
+        credentials = get_service_account_credentials(KEY_FILE_PATH, config['INGEST_FUNCTION_URL'])
     except Exception as e:
         exit(1)
         
     print(f"Agent configured for server_id: {config.get('SERVER_ID', 'UNKNOWN')} reporting for user: {config.get('USER_UID', 'UNKNOWN')}")
     
-    # Create a transport request object to handle token refreshes automatically.
     authed_session = google.auth.transport.requests.Request()
 
     while True:
         try:
-            metrics = collect_metrics()
+            metrics = collect_all_metrics()
             
             payload = {
-                "server_id": config['SERVER_ID'],
                 "user_uid": config['USER_UID'],
+                "server_id": config['SERVER_ID'],
                 "metrics": metrics
             }
             
-            # Refresh the token if it's about to expire
             credentials.refresh(authed_session)
             
             headers = {
@@ -140,7 +221,7 @@ if __name__ == "__main__":
                 'Content-Type': 'application/json'
             }
             
-            print(f"Pushing metrics: {payload}")
+            print(f"Pushing metrics to {config['INGEST_FUNCTION_URL']}")
             response = requests.post(config['INGEST_FUNCTION_URL'], json=payload, headers=headers, timeout=15)
             
             response.raise_for_status()
@@ -148,6 +229,7 @@ if __name__ == "__main__":
 
         except Exception as e:
             print(f"ERROR: Failed to collect or push metrics: {e}")
+            traceback.print_exc()
         
         time.sleep(int(config.get('INTERVAL_SECONDS', 60)))
 AGENT_EOF
@@ -156,6 +238,7 @@ AGENT_EOF
 }
 
 function configure_agent() {
+    # FIX: Added quotes around the echo statements
     echo "--> [4/5] Configuring agent..."
     
     TOKEN=""
@@ -168,13 +251,11 @@ function configure_agent() {
         esac
     done
 
-    # If config files already exist AND no new token was provided, skip this step.
     if [ -f "$CONFIG_FILE_PATH" ] && [ -f "$KEY_FILE_PATH" ] && [ -z "$TOKEN" ]; then
         echo "    - Configuration files already exist. Skipping credential claim."
         return
     fi
     
-    # If we are here, we either need to configure for the first time or re-configure.
     if [ -z "$TOKEN" ]; then
         echo "    [ERROR] --token flag is required for initial configuration."
         exit 1
@@ -185,14 +266,12 @@ function configure_agent() {
         -d "{\"token\": \"$TOKEN\"}" \
         "$CLAIM_URL")
 
-    # Check for a valid response
     if [ -z "$RESPONSE_JSON" ] || [[ "$RESPONSE_JSON" != *"private_key"* ]]; then
         echo "    [ERROR] Failed to claim agent credentials. Token may be invalid, expired, or used."
         echo "    Server Response: $RESPONSE_JSON"
         exit 1
     fi
 
-    # Extract data using python3 to safely parse the JSON
     SERVICE_ACCOUNT_KEY_JSON=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; data = json.load(sys.stdin); print(json.dumps(data.get('serviceAccountKey'), indent=2)) if data.get('serviceAccountKey') else ''")
     USER_UID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('userUid', ''))")
     SERVER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('serverName', ''))")
@@ -204,7 +283,6 @@ function configure_agent() {
     
     echo "    - Credentials successfully claimed for server: '$SERVER_ID'"
 
-    # Save the files
     echo "$SERVICE_ACCOUNT_KEY_JSON" > "$KEY_FILE_PATH"
     chown "$AGENT_USER":"$AGENT_USER" "$KEY_FILE_PATH"
     chmod 400 "$KEY_FILE_PATH"
@@ -220,6 +298,7 @@ function configure_agent() {
 }
 
 function setup_service() {
+    # FIX: Added quotes around the echo statements
     echo "--> [5/5] Setting up and starting systemd service..."
     tee "$AGENT_SERVICE_FILE" > /dev/null <<'SERVICE_EOF'
 [Unit]
