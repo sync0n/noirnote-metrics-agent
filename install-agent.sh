@@ -15,7 +15,7 @@ CONFIG_FILE_PATH="${CONFIG_DIR}/agent.conf"
 
 # The URLs for the cloud functions
 CLAIM_URL="https://europe-west3-noirnote.cloudfunctions.net/claimAgentToken"
-INGEST_URL="https://europe-west3-noirnote.cloudfunctions.net/ingestMetrics"
+INGEST_URL="INGEST_URL="https://chronos.noirnote.it/ingest"
 
 # --- Helper Functions ---
 function check_root() {
