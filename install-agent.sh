@@ -310,7 +310,7 @@ Wants=network-online.target
 Type=simple
 User=noirnote-agent
 Group=noirnote-agent
-ExecStart=/usr/bin/python3 /opt/noirnote-agent/noirnote_agent.py
+ExecStart=/usr/bin/python3 -u /opt/noirnote-agent/noirnote_agent.py
 Restart=on-failure
 RestartSec=10
 
