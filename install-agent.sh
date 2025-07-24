@@ -27,7 +27,6 @@ function check_root() {
 }
 
 function install_dependencies() {
-    # FIX: Added quotes around the echo statements
     echo "--> [1/5] Installing dependencies..."
     if ! command -v apt-get &> /dev/null; then
         echo "Error: apt-get not found. This script is for Debian/Ubuntu systems."
@@ -42,7 +41,6 @@ function install_dependencies() {
 }
 
 function setup_agent_user_and_dirs() {
-    # FIX: Added quotes around the echo statements
     echo "--> [2/5] Setting up user and directories..."
     if ! id -u "$AGENT_USER" >/dev/null 2>&1; then
         useradd --system --shell /usr/sbin/nologin "$AGENT_USER"
@@ -60,10 +58,8 @@ function setup_agent_user_and_dirs() {
 }
 
 function create_agent_script() {
-    # FIX: Added quotes around the echo statements
     echo "--> [3/5] Creating agent script at ${AGENT_SCRIPT_PATH}..."
     # The agent code is embedded here using a "heredoc".
-    # --- ENHANCEMENT: Merged the advanced agent code here ---
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
 # agent/noirnote_agent.py
 import psutil
@@ -101,7 +97,6 @@ def get_service_account_credentials(key_path, target_audience):
     Creates credentials that can be used to invoke a secured Cloud Run/Function service.
     """
     try:
-        # This creates a credential object that can mint its own JWTs.
         creds = service_account.IDTokenCredentials.from_service_account_file(
             key_path,
             target_audience=target_audience
@@ -116,7 +111,6 @@ def get_top_processes(limit=10):
     procs = []
     for p in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent', 'memory_percent']):
         try:
-            # cpu_percent can be high initially, call it again for a better reading
             p.cpu_percent(interval=0.01) 
             time.sleep(0.01)
             p.cpu_percent(interval=None)
@@ -124,10 +118,8 @@ def get_top_processes(limit=10):
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     
-    # Sort by cpu_percent, then memory_percent, descending
     top_procs = sorted(procs, key=lambda p: (p.info['cpu_percent'], p.info['memory_percent']), reverse=True)
     
-    # Format the output
     return [
         {
             "pid": p.info['pid'], 
@@ -200,7 +192,7 @@ if __name__ == "__main__":
     except Exception as e:
         exit(1)
         
-    print(f"Agent configured for server_id: {config.get('SERVER_ID', 'UNKNOWN')} reporting for user: {config.get('USER_UID', 'UNKNOWN')}")
+    print(f"Agent configured for server_id: {config.get('SERVER_ID', 'UNKNOWN')} reporting for user: {config.get('USER_ID', 'UNKNOWN')}")
     
     authed_session = google.auth.transport.requests.Request()
 
@@ -208,8 +200,10 @@ if __name__ == "__main__":
         try:
             metrics = collect_all_metrics()
             
+            # The payload now uses 'user_id' to match the Go ingestor and JWT claims.
+            # The agent reads 'USER_ID' from its config file.
             payload = {
-                "user_uid": config['USER_UID'],
+                "user_id": config['USER_ID'],
                 "server_id": config['SERVER_ID'],
                 "metrics": metrics
             }
@@ -238,7 +232,6 @@ AGENT_EOF
 }
 
 function configure_agent() {
-    # FIX: Added quotes around the echo statements
     echo "--> [4/5] Configuring agent..."
     
     TOKEN=""
@@ -273,10 +266,13 @@ function configure_agent() {
     fi
 
     SERVICE_ACCOUNT_KEY_JSON=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; data = json.load(sys.stdin); print(json.dumps(data.get('serviceAccountKey'), indent=2)) if data.get('serviceAccountKey') else ''")
-    USER_UID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('userUid', ''))")
-    SERVER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('serverName', ''))")
     
-    if [ -z "$SERVICE_ACCOUNT_KEY_JSON" ] || [ -z "$USER_UID" ] || [ -z "$SERVER_ID" ]; then
+    # This now correctly parses 'userId' from the cloud function response.
+    USER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('userId', ''))")
+    
+    SERVER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('serverId', ''))")
+    
+    if [ -z "$SERVICE_ACCOUNT_KEY_JSON" ] || [ -z "$USER_ID" ] || [ -z "$SERVER_ID" ]; then
         echo "    [ERROR] Claim response was incomplete. Could not find all required fields."
         exit 1
     fi
@@ -288,8 +284,9 @@ function configure_agent() {
     chmod 400 "$KEY_FILE_PATH"
     echo "    - Service account key saved securely."
 
+    # This now correctly writes USER_ID to the agent's config file.
     echo "SERVER_ID=$SERVER_ID" > "$CONFIG_FILE_PATH"
-    echo "USER_UID=$USER_UID" >> "$CONFIG_FILE_PATH"
+    echo "USER_ID=$USER_ID" >> "$CONFIG_FILE_PATH"
     echo "INGEST_FUNCTION_URL=$INGEST_URL" >> "$CONFIG_FILE_PATH"
     echo "INTERVAL_SECONDS=60" >> "$CONFIG_FILE_PATH"
     chown "$AGENT_USER":"$AGENT_USER" "$CONFIG_FILE_PATH"
@@ -298,7 +295,6 @@ function configure_agent() {
 }
 
 function setup_service() {
-    # FIX: Added quotes around the echo statements
     echo "--> [5/5] Setting up and starting systemd service..."
     tee "$AGENT_SERVICE_FILE" > /dev/null <<'SERVICE_EOF'
 [Unit]
