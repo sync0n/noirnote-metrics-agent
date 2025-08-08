@@ -1,3 +1,5 @@
+Of course. Here is the complete, updated noirnote_agent.py script with all the requested features for advanced state collection, formatted for readability.
+
 code
 Python
 download
@@ -27,7 +29,7 @@ STATE_FILE_PATH = "/var/lib/noirnote-agent/state.json"
 last_net_io = psutil.net_io_counters()
 last_time = time.time()
 
-# --- State Management Functions ---
+# --- State Management Functions (for event processing) ---
 
 def load_state():
     """Loads the agent's state from a file to avoid reprocessing events."""
@@ -38,7 +40,7 @@ def load_state():
             return json.load(f)
     except (json.JSONDecodeError, IOError, PermissionError) as e:
         print(f"WARN: Could not load agent state from {STATE_FILE_PATH}, starting fresh. Error: {e}")
-        return {} # Return empty dict if file is corrupt, unreadable, or permission denied
+        return {}
 
 def save_state(state):
     """Saves the agent's state to a file."""
@@ -48,46 +50,145 @@ def save_state(state):
     except (IOError, PermissionError) as e:
         print(f"ERROR: Could not save agent state to {STATE_FILE_PATH}: {e}")
 
-# --- Event Collection: Linux Log Parsers ---
+# --- State Snapshot Collection (for AI Root Cause Analysis) ---
+
+def _run_command(command):
+    """A robust helper to run a shell command and return its output or an error."""
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False  # Don't raise exception on non-zero exit codes
+        )
+        if result.returncode != 0:
+            # Combine stdout and stderr for better error context
+            error_output = (result.stdout.strip() + " " + result.stderr.strip()).strip()
+            return f"Error executing command '{command}': [Exit Code {result.returncode}] {error_output}"
+        return result.stdout.strip()
+    except FileNotFoundError:
+        return f"Error: Command not found for '{command}'."
+    except subprocess.TimeoutExpired:
+        return f"Error: Command '{command}' timed out after 20 seconds."
+    except Exception as e:
+        return f"An unexpected error occurred while running '{command}': {e}"
+
+def get_dmesg_output():
+    """Gets kernel ring buffer messages."""
+    return _run_command("dmesg -T")
+
+def get_netstat_output():
+    """Gets network connection and listening port information."""
+    return _run_command("netstat -tulnp")
+
+def get_syslog_snippet():
+    """Gets the last 200 lines from journalctl or syslog."""
+    if os.path.exists('/bin/journalctl'):
+        return _run_command("journalctl -n 200 --no-pager")
+    elif os.path.exists('/var/log/syslog'):
+        return _run_command("tail -n 200 /var/log/syslog")
+    else:
+        return "Neither journalctl nor /var/log/syslog found."
+
+def get_messages_log_snippet():
+    """Gets the last 200 lines from /var/log/messages (for RHEL/CentOS)."""
+    if os.path.exists('/var/log/messages'):
+        return _run_command("tail -n 200 /var/log/messages")
+    return ""  # Return empty if file doesn't exist, not an error
+
+def get_kern_log_snippet():
+    """Gets the last 200 lines from /var/log/kern.log."""
+    if os.path.exists('/var/log/kern.log'):
+        return _run_command("tail -n 200 /var/log/kern.log")
+    return ""
+
+def get_auth_log_snippet():
+    """Gets the last 200 lines from the auth log."""
+    if os.path.exists('/var/log/auth.log'):
+        return _run_command("tail -n 200 /var/log/auth.log")
+    elif os.path.exists('/var/log/secure'):
+        return _run_command("tail -n 200 /var/log/secure")
+    return ""
+
+def get_windows_event_logs():
+    """Queries and formats the last 50 System and Security events on Windows."""
+    ps_command = """
+    $logs = @{
+        "System" = Get-WinEvent -LogName System -MaxEvents 50 | Select-Object TimeCreated, LevelDisplayName, Message -ErrorAction SilentlyContinue;
+        "Security" = Get-WinEvent -LogName Security -MaxEvents 50 | Select-Object TimeCreated, Message -ErrorAction SilentlyContinue
+    }
+    $logs | ConvertTo-Json -Compress -Depth 3
+    """
+    try:
+        result = subprocess.run(
+            ["powershell", "-Command", ps_command],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True
+        )
+        return json.loads(result.stdout.strip())
+    except FileNotFoundError:
+        return {"error": "PowerShell is not installed or not in PATH."}
+    except subprocess.CalledProcessError as e:
+        return {"error": f"PowerShell command failed: {e.stderr}"}
+    except subprocess.TimeoutExpired:
+        return {"error": "PowerShell command timed out after 30 seconds."}
+    except json.JSONDecodeError:
+        return {"error": "Failed to parse JSON output from PowerShell."}
+    except Exception as e:
+        return {"error": f"An unexpected error occurred while fetching Windows events: {e}"}
+
+def collect_state_snapshot():
+    """
+    Orchestrates the collection of a comprehensive state snapshot for analysis.
+    """
+    print("--> Collecting state snapshot...")
+    snapshot = {}
+    system = platform.system()
+
+    if system == "Linux":
+        snapshot['dmesg'] = get_dmesg_output()
+        snapshot['netstat'] = get_netstat_output()
+        snapshot['syslog_snippet'] = get_syslog_snippet()
+        snapshot['messages_log_snippet'] = get_messages_log_snippet()
+        snapshot['kern_log_snippet'] = get_kern_log_snippet()
+        snapshot['auth_log_snippet'] = get_auth_log_snippet()
+    elif system == "Windows":
+        snapshot['windows_event_logs'] = get_windows_event_logs()
+
+    print("--> State snapshot collection complete.")
+    return snapshot
+
+# --- Event Collection ---
 
 def _read_new_log_lines(log_path, state):
-    """
-    A generic helper to read new lines from a log file, handling log rotation.
-    It uses the file's inode to detect rotation and byte offset for position.
-    """
+    """Generic helper to read new lines from a log file, handling log rotation."""
     new_lines = []
     if not os.path.exists(log_path):
         return new_lines
-
     try:
         current_inode = os.stat(log_path).st_ino
     except (FileNotFoundError, PermissionError) as e:
         print(f"WARN: Cannot stat log file {log_path}: {e}")
         return new_lines
-
     log_state = state.get(log_path, {})
     last_inode = log_state.get('inode')
     last_offset = log_state.get('offset', 0)
-
-    # Check for log rotation
     if current_inode != last_inode:
         last_offset = 0
-
     try:
-        with open(log_path, 'rb') as f: # Open as binary to get accurate byte offsets
+        with open(log_path, 'rb') as f:
             f.seek(last_offset)
             raw_lines = f.readlines()
             new_offset = f.tell()
     except (IOError, PermissionError) as e:
         print(f"WARN: Could not read from log file {log_path}: {e}")
         return new_lines
-    
-    # Decode lines, ignoring errors
     new_lines = [line.decode('utf-8', errors='ignore').strip() for line in raw_lines]
-
-    # Update state for this file
     state[log_path] = {'inode': current_inode, 'offset': new_offset}
-    
     return new_lines
 
 def _create_event(event_type, summary):
@@ -102,65 +203,43 @@ def parse_auth_log(state):
     """Parses auth.log or secure for login events."""
     events = []
     log_file = '/var/log/auth.log' if os.path.exists('/var/log/auth.log') else '/var/log/secure'
-    
-    new_lines = _read_new_log_lines(log_file, state)
-    for line in new_lines:
-        # Successful SSH login
+    for line in _read_new_log_lines(log_file, state):
         match = re.search(r'sshd.*?session opened for user (\w+)', line)
         if match:
-            user = match.group(1)
-            events.append(_create_event('USER_LOGIN', f"User '{user}' logged in via SSH"))
+            events.append(_create_event('USER_LOGIN', f"User '{match.group(1)}' logged in via SSH"))
             continue
-            
-        # Failed login
         match = re.search(r'Failed password for (\w+) from ([\d.]+)', line)
         if match:
-            user, ip = match.groups()
-            events.append(_create_event('FAILED_LOGIN', f"Failed password for '{user}' from {ip}"))
+            events.append(_create_event('FAILED_LOGIN', f"Failed password for '{match.group(1)}' from {match.group(2)}"))
             continue
-
     return events
 
 def parse_package_log(state):
     """Parses apt/history.log or dnf.log for package changes."""
     events = []
-    log_files = ['/var/log/apt/history.log', '/var/log/dnf.log']
-    
-    log_file_to_use = None
-    for f in log_files:
+    log_file = None
+    for f in ['/var/log/apt/history.log', '/var/log/dnf.log']:
         if os.path.exists(f):
-            log_file_to_use = f
+            log_file = f
             break
-            
-    if not log_file_to_use:
+    if not log_file:
         return events
-
-    new_lines = _read_new_log_lines(log_file_to_use, state)
-    for line in new_lines:
-        # APT Install/Upgrade
+    for line in _read_new_log_lines(log_file, state):
         install_match = re.search(r'Install: ([\w.+-]+):.*? \((.*?)\)', line)
         if install_match:
-            package, version = install_match.groups()
-            package_name = package.split(':')[0]
-            events.append(_create_event('PACKAGE_CHANGE', f"Package '{package_name}' installed (version {version})"))
+            pkg_name = install_match.group(1).split(':')[0]
+            events.append(_create_event('PACKAGE_CHANGE', f"Package '{pkg_name}' installed (version {install_match.group(2)})"))
             continue
-            
         upgrade_match = re.search(r'Upgrade: ([\w.+-]+):.*? \((.*?)\), ([\w.+-]+):.*? \((.*?)\)', line)
         if upgrade_match:
-            package, old_ver, _, new_ver = upgrade_match.groups()
-            package_name = package.split(':')[0]
-            events.append(_create_event('PACKAGE_CHANGE', f"Package '{package_name}' upgraded to '{new_ver}'"))
+            pkg_name = upgrade_match.group(1).split(':')[0]
+            events.append(_create_event('PACKAGE_CHANGE', f"Package '{pkg_name}' upgraded to '{upgrade_match.group(4)}'"))
             continue
-
-        # DNF Install/Upgrade (often on the same "Upgraded" or "Installed" line)
         dnf_match = re.search(r'^(?:Install|Upgrade|Installed|Upgraded): ([\w-]+)-([0-9].*)', line)
         if dnf_match:
-            package, version = dnf_match.groups()
-            summary = f"Package '{package}' was installed or upgraded to version '{version}'"
-            if any(e['summary'].startswith(f"Package '{package}'") for e in events):
-                continue # Avoid duplicate events if DNF logs verbosely
-            events.append(_create_event('PACKAGE_CHANGE', summary))
-
+            summary = f"Package '{dnf_match.group(1)}' was installed or upgraded to version '{dnf_match.group(2)}'"
+            if not any(e['summary'].startswith(f"Package '{dnf_match.group(1)}'") for e in events):
+                events.append(_create_event('PACKAGE_CHANGE', summary))
     return events
 
 def parse_syslog_and_kern(state):
@@ -172,76 +251,42 @@ def parse_syslog_and_kern(state):
         '/var/log/kern.log': 'KERNEL_ERROR',
     }
     keywords = ['error', 'failed', 'fatal', 'segfault', 'panic', 'out of memory', 'critical']
-
     for log_file, event_type in log_files.items():
-        new_lines = _read_new_log_lines(log_file, state)
-        for line in new_lines:
+        for line in _read_new_log_lines(log_file, state):
             if any(keyword in line.lower() for keyword in keywords):
-                # Truncate long lines
                 summary = (line[:250] + '...') if len(line) > 253 else line
                 events.append(_create_event(event_type, summary))
     return events
 
-
-# --- Event Collection: Windows ---
-
 def get_windows_events(state):
-    """Uses PowerShell to get new Windows Events."""
+    """Uses PowerShell to get new Windows Events (for structured event stream)."""
     events = []
-    
-    # --- Security Log: Successful Logins (EventID 4624) ---
     log_name = "Security"
     event_id = 4624
     state_key = f"win_event_{log_name}_{event_id}_last_id"
     last_record_id = state.get(state_key, 0)
-    
-    # Note: PowerShell 5.1 (default on Win10/Server2016/2019) syntax.
-    # PowerShell 7+ might have slightly different parameter handling.
-    ps_command = f"""
-    Get-WinEvent -LogName {log_name} -FilterXPath "*[System[EventID={event_id} and EventRecordID > {last_record_id}]]" |
-    Select-Object TimeCreated, Message, RecordId |
-    Sort-Object RecordId |
-    ConvertTo-Json
-    """
-    
+    ps_command = f'Get-WinEvent -LogName {log_name} -FilterXPath "*[System[EventID={event_id} and EventRecordID > {last_record_id}]]" | Select-Object TimeCreated, Message, RecordId | Sort-Object RecordId | ConvertTo-Json'
     try:
-        # The `capture_output=True`, `text=True` are crucial.
         result = subprocess.run(["powershell", "-Command", ps_command], capture_output=True, text=True, check=True, timeout=20)
-        
-        # PowerShell might return a single object or an array of objects.
-        # `json.loads` will handle both.
         win_events = json.loads(result.stdout.strip())
-        
         if not isinstance(win_events, list):
             win_events = [win_events]
-
         max_id = last_record_id
         for win_event in win_events:
-            # Simple parsing of the message for the user. More complex parsing is possible.
             summary_match = re.search(r'Account Name:\s+([\w\-$]+)', win_event['Message'])
             summary = f"User '{summary_match.group(1)}' logged on." if summary_match else "A user successfully logged on."
             events.append(_create_event('USER_LOGIN', summary))
             if win_event['RecordId'] > max_id:
                 max_id = win_event['RecordId']
-        
         state[state_key] = max_id
-
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
-        # FileNotFoundError if powershell isn't on PATH.
-        print(f"WARN: Could not execute PowerShell command for {log_name} log. Error: {e}")
     except Exception as e:
-        print(f"ERROR: An unexpected error occurred while fetching Windows events. {e}")
-
+        print(f"WARN: Could not execute PowerShell command for {log_name} log. Error: {e}")
     return events
-
-
-# --- Main Orchestrator Functions ---
 
 def collect_events(state):
     """Gathers all system events from various sources based on the OS."""
     all_events = []
     print("--> Collecting events...")
-    
     system = platform.system()
     if system == "Linux":
         all_events.extend(parse_auth_log(state))
@@ -249,55 +294,35 @@ def collect_events(state):
         all_events.extend(parse_syslog_and_kern(state))
     elif system == "Windows":
         all_events.extend(get_windows_events(state))
-    else:
-        print(f"WARN: Event collection not supported on this OS: {system}")
-
     if all_events:
         print(f"--> Collected {len(all_events)} new events.")
     return all_events
+
+# --- Metrics Collection ---
 
 def collect_all_metrics():
     """Gathers all enhanced system metrics."""
     global last_net_io, last_time
     print("--> Collecting metrics...")
-
-    # CPU
-    psutil.cpu_percent(interval=0.1) # Prime the pump
+    psutil.cpu_percent(interval=0.1)
     cpu_percent = psutil.cpu_percent(interval=1)
-    
-    # Memory
-    mem = psutil.virtual_memory()
-    memory_percent = mem.percent
-
-    # Disk
+    memory_percent = psutil.virtual_memory().percent
     disks = []
     for part in psutil.disk_partitions(all=False):
-        # Filter out docker overlayfs, tmpfs, and snap loops
         if 'loop' in part.device or any(fs in part.fstype for fs in ['tmpfs', 'squashfs']):
             continue
         try:
             usage = psutil.disk_usage(part.mountpoint)
-            disks.append({
-                "device": part.device,
-                "mountpoint": part.mountpoint,
-                "percent": usage.percent
-            })
+            disks.append({"device": part.device, "mountpoint": part.mountpoint, "percent": usage.percent})
         except Exception:
             continue
-    
-    # Processes
     procs = []
     for p in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent', 'memory_percent']):
         try:
-            # This logic avoids re-calculating CPU for every process, but might be slightly stale.
-            # For this agent's purpose, it's a good trade-off.
             procs.append(p.info)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     top_procs = sorted(procs, key=lambda p: (p.get('cpu_percent', 0) or 0, p.get('memory_percent', 0) or 0), reverse=True)
-
-
-    # Network
     current_net_io = psutil.net_io_counters()
     current_time = time.time()
     elapsed_time = current_time - last_time
@@ -306,30 +331,20 @@ def collect_all_metrics():
     else:
         bytes_sent_rate = (current_net_io.bytes_sent - last_net_io.bytes_sent) / elapsed_time
         bytes_recv_rate = (current_net_io.bytes_recv - last_net_io.bytes_recv) / elapsed_time
-        net_rate = {
-            "bytes_sent_per_sec": int(bytes_sent_rate),
-            "bytes_recv_per_sec": int(bytes_recv_rate)
-        }
+        net_rate = {"bytes_sent_per_sec": int(bytes_sent_rate), "bytes_recv_per_sec": int(bytes_recv_rate)}
     last_net_io = current_net_io
     last_time = current_time
-
-    metrics = {
-        "cpu_percent": cpu_percent,
-        "memory_percent": memory_percent,
-        "disks": disks,
-        "processes": top_procs[:10],
-        "network": net_rate,
-    }
+    metrics = {"cpu_percent": cpu_percent, "memory_percent": memory_percent, "disks": disks, "processes": top_procs[:10], "network": net_rate}
     print("--> Metrics collection complete.")
     return metrics
 
+# --- Core Agent Logic ---
 
 def load_config():
     """Loads agent configuration from the config file."""
     config = {}
     if not os.path.exists(CONFIG_FILE_PATH):
-        print(f"FATAL: Config file not found at '{CONFIG_FILE_PATH}'")
-        raise FileNotFoundError
+        raise FileNotFoundError(f"FATAL: Config file not found at '{CONFIG_FILE_PATH}'")
     with open(CONFIG_FILE_PATH, 'r') as f:
         for line in f:
             if '=' in line:
@@ -338,77 +353,61 @@ def load_config():
     return config
 
 def get_service_account_credentials(key_path, target_audience):
-    """Creates credentials that can be used to invoke a secured Cloud Run/Function service."""
+    """Creates credentials that can be used to invoke a secured service."""
     try:
-        creds = service_account.IDTokenCredentials.from_service_account_file(
-            key_path,
-            target_audience=target_audience
-        )
-        return creds
+        return service_account.IDTokenCredentials.from_service_account_file(key_path, target_audience=target_audience)
     except Exception as e:
-        print(f"FATAL: Could not create service account credentials. Error: {e}")
-        raise
+        raise Exception(f"FATAL: Could not create service account credentials. Error: {e}")
 
 # --- Main Execution Loop ---
 if __name__ == "__main__":
-    print("Starting NoirNote Event & Metrics Agent...")
+    print("Starting NoirNote Full State Agent...")
     try:
         config = load_config()
         credentials = get_service_account_credentials(KEY_FILE_PATH, config['INGEST_FUNCTION_URL'])
     except Exception as e:
+        print(e)
         exit(1)
         
     print(f"Agent configured for server_id: {config.get('SERVER_ID', 'UNKNOWN')} "
           f"workspace_id: {config.get('WORKSPACE_ID', 'UNKNOWN')}")
     
-    # Load state at startup
     state = load_state()
-    
     authed_session = google.auth.transport.requests.Request()
 
     while True:
         try:
-            # Collect both metrics and events
             metrics = collect_all_metrics()
             events = collect_events(state)
-            
-            # Construct the full payload
+            state_snapshot = collect_state_snapshot()  # <<< NEW FUNCTION CALL
+
             payload = {
                 "user_id": config['USER_ID'],
-                "workspace_id": config['WORKSPACE_ID'],
+                "workspace_id": config.get('WORKSPACE_ID', config['USER_ID']),
                 "server_id": config['SERVER_ID'],
                 "metrics": metrics,
-                "events": events
+                "events": events,
+                "state": state_snapshot  # <<< NEW DATA STRUCTURE
             }
             
-            # Send data only if there's something to send (metrics are always sent)
-            if not metrics and not events:
-                print("No new metrics or events to send. Skipping cycle.")
-            else:
-                credentials.refresh(authed_session)
-                
-                headers = {
-                    'Authorization': f'Bearer {credentials.token}',
-                    'Content-Type': 'application/json'
-                }
-                
-                print(f"Pushing payload to {config['INGEST_FUNCTION_URL']}...")
-                # print(json.dumps(payload, indent=2)) # Uncomment for deep debugging
-                response = requests.post(config['INGEST_FUNCTION_URL'], json=payload, headers=headers, timeout=30)
-                
-                response.raise_for_status()
-                print(f"Successfully pushed payload. Status: {response.status_code}")
+            credentials.refresh(authed_session)
+            headers = {'Authorization': f'Bearer {credentials.token}', 'Content-Type': 'application/json'}
+            
+            print(f"Pushing full payload to {config['INGEST_FUNCTION_URL']}...")
+            # Uncomment for deep debugging of the entire payload:
+            # print(json.dumps(payload, indent=2))
+            
+            response = requests.post(config['INGEST_FUNCTION_URL'], json=payload, headers=headers, timeout=30)
+            
+            response.raise_for_status()
+            print(f"Successfully pushed payload. Status: {response.status_code}")
 
-                # Save state only after a successful send
-                save_state(state)
+            save_state(state)
 
         except requests.exceptions.RequestException as e:
             print(f"ERROR: Network error while pushing payload: {e}")
-            # Do NOT save state on network failure, so we can retry sending the events.
         except Exception as e:
             print(f"ERROR: An unhandled exception occurred in the main loop: {e}")
             traceback.print_exc()
-            # Optionally save state here depending on whether the error was pre- or post-send.
-            # For safety, we don't save state on generic errors to avoid data loss.
         
         time.sleep(int(config.get('INTERVAL_SECONDS', 60)))
