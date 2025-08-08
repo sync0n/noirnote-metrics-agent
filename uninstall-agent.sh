@@ -1,13 +1,3 @@
-Of course. Here is the complete and updated uninstall-agent.sh script.
-
-The primary change is the addition of a command to remove the new state directory (/var/lib/noirnote-agent), ensuring no files are left behind after uninstallation.
-
-code
-Bash
-download
-content_copy
-expand_less
-
 #!/bin/bash
 
 set -e # Exit immediately if a command exits with a non-zero status.
