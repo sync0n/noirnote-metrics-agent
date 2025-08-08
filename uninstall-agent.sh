@@ -1,3 +1,13 @@
+Of course. Here is the complete and updated uninstall-agent.sh script.
+
+The primary change is the addition of a command to remove the new state directory (/var/lib/noirnote-agent), ensuring no files are left behind after uninstallation.
+
+code
+Bash
+download
+content_copy
+expand_less
+
 #!/bin/bash
 
 set -e # Exit immediately if a command exits with a non-zero status.
@@ -8,6 +18,7 @@ echo "--- NoirNote Agent Uninstaller ---"
 AGENT_USER="noirnote-agent"
 AGENT_DIR="/opt/noirnote-agent"
 CONFIG_DIR="/etc/noirnote"
+STATE_DIR="/var/lib/noirnote-agent" # <-- NEW: State directory to remove
 AGENT_SERVICE_FILE="/etc/systemd/system/noirnote-agent.service"
 PYTHON_PACKAGES="psutil requests google-auth"
 
@@ -65,11 +76,20 @@ function remove_agent_files() {
     else
         echo "    - Configuration directory not found (already removed)."
     fi
+
+    # Remove the agent's state directory
+    if [ -d "$STATE_DIR" ]; then
+        rm -rf "$STATE_DIR"
+        echo "    - Removed agent state directory: $STATE_DIR"
+    else
+        echo "    - Agent state directory not found (already removed)."
+    fi
 }
 
 function remove_agent_user() {
     echo "--> [3/5] Removing agent user..."
     if id -u "$AGENT_USER" >/dev/null 2>&1; then
+        # The `userdel` command automatically removes the user from any groups.
         userdel "$AGENT_USER"
         echo "    - Removed system user '$AGENT_USER'."
     else
@@ -93,7 +113,7 @@ function final_summary() {
     echo ""
     echo "--- Uninstallation Complete! ---"
     echo "The NoirNote agent and all its components have been removed."
-    echo "You may want to run 'apt-get autoremove' to clean up any other unused dependencies."
+    echo "You may want to run 'sudo apt-get autoremove' to clean up any other unused dependencies."
 }
 
 # --- Main Execution ---
