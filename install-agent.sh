@@ -1,4 +1,28 @@
-Of course. Here is the complete install-agent.sh script with all the requested modifications. The changes are confined to the embedded noirnote_agent.py script as specified, ensuring the agent can now monitor user-defined logs and configuration files.
+Of course. I have updated the new installer script to restore the requested functionalities, bringing back the data points you specified from the original version.
+
+Here are the key changes I've implemented:
+
+Installer Script (install-agent.sh) Changes:
+
+A new step, [5/8] Configuring Custom Integrations, has been added.
+
+This step checks for the existence of /etc/noirnote/integrations.conf.
+
+If found, it parses the [logs] section and dynamically creates a Fluent Bit configuration file at /etc/fluent-bit/conf.d/noirnote-custom.conf. This seamlessly integrates user-defined logs into the new Fluent Bit architecture.
+
+Step numbering and titles have been updated accordingly.
+
+Agent Script (noirnote_agent.py) Changes:
+
+Disk & TCP Metrics Restored: The collect_all_metrics function now collects disk partition usage and TCP connection state counts, adding them back to the metrics payload.
+
+PID in State Snapshot Restored: The INTEGRATION_KNOWLEDGE_MAP has been updated with pid_path information. The collect_state_snapshot function now reads the PID from the service's PID file and includes it with the configuration data.
+
+Custom Configs Restored: The collect_state_snapshot function now calls a restored load_user_integrations function to read configuration files specified in the [configs] section of /etc/noirnote/integrations.conf and adds them to the state snapshot.
+
+This updated version provides the best of both worlds: the robust, structured logging of the new architecture combined with the comprehensive data collection of the original.
+
+Here is the complete, updated install-agent.sh script:
 
 code
 Bash
@@ -10,23 +34,34 @@ expand_less
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-echo "--- NoirNote Agent Installer (Context-Aware v6) ---"
+echo "--- NoirNote Agent Installer (Multi-OS v9 with Fluent Bit & Custom Integrations) ---"
 
-# --- Configuration ---
+# --- Global Variables ---
 AGENT_USER="noirnote-agent"
 AGENT_DIR="/opt/noirnote-agent"
 CONFIG_DIR="/etc/noirnote"
-STATE_DIR="/var/lib/noirnote-agent" 
+STATE_DIR="/var/lib/noirnote-agent"
 AGENT_SERVICE_FILE="/etc/systemd/system/noirnote-agent.service"
 AGENT_SCRIPT_PATH="${AGENT_DIR}/noirnote_agent.py"
 KEY_FILE_PATH="${CONFIG_DIR}/agent-key.json"
 CONFIG_FILE_PATH="${CONFIG_DIR}/agent.conf"
+USER_INTEGRATIONS_CONFIG_PATH="/etc/noirnote/integrations.conf"
+
+# Fluent Bit configuration paths
+FLUENTBIT_CONF_DIR="/etc/fluent-bit/conf.d"
+NOIRNOTE_FLUENTBIT_CONF="${FLUENTBIT_CONF_DIR}/noirnote.conf"
+NOIRNOTE_CUSTOM_FLUENTBIT_CONF="${FLUENTBIT_CONF_DIR}/noirnote-custom.conf"
+NOIRNOTE_PARSERS_CONF="/etc/fluent-bit/noirnote-parsers.conf"
 
 # The URLs for the cloud functions
 CLAIM_URL="https://europe-west3-noirnote.cloudfunctions.net/claimAgentToken"
-INGEST_URL="https://chronos.noirnote.it/ingest" 
+INGEST_URL="https://chronos.noirnote.it/ingest"
 
-# --- Helper Functions ---
+# Variable to hold the detected OS family
+OS_FAMILY=""
+
+# --- Helper and OS-Specific Functions ---
+
 function check_root() {
     if [ "$EUID" -ne 0 ]; then
       echo "Error: This installer must be run with sudo or as root."
@@ -34,20 +69,56 @@ function check_root() {
     fi
 }
 
-function install_dependencies() {
-    echo "--> [1/5] Installing dependencies..."
-    if ! command -v apt-get &> /dev/null; then
-        echo "Error: apt-get not found. This script is for Debian/Ubuntu systems."
+function detect_os() {
+    echo "--> [1/8] Detecting operating system..."
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        if [[ "$ID" == "ubuntu" || "$ID" == "debian" || "$ID_LIKE" == "debian" ]]; then
+            OS_FAMILY="debian"
+        elif [[ "$ID" == "centos" || "$ID" == "rhel" || "$ID" == "fedora" || "$ID_LIKE" == "rhel fedora" ]]; then
+            OS_FAMILY="rhel"
+        else
+            echo "Error: Unsupported Linux distribution: $ID"
+            exit 1
+        fi
+        echo "    - Detected OS Family: $OS_FAMILY"
+    else
+        echo "Error: Cannot detect operating system. /etc/os-release not found."
         exit 1
     fi
-    apt-get update -y > /dev/null
-    apt-get install -y python3 python3-pip python3-venv curl net-tools > /dev/null
+}
+
+function install_dependencies() {
+    echo "--> [2/8] Installing dependencies for $OS_FAMILY..."
+    case "$OS_FAMILY" in
+        "debian")
+            apt-get update -y > /dev/null
+            apt-get install -y curl gpg lsb-release > /dev/null
+            curl -s https://packages.fluentbit.io/fluentbit.key | gpg --dearmor > /usr/share/keyrings/fluentbit-key.gpg
+            echo "deb [signed-by=/usr/share/keyrings/fluentbit-key.gpg] https://packages.fluentbit.io/ubuntu/$(lsb_release -cs) $(lsb_release -cs) main" > /etc/apt/sources.list.d/fluent-bit.list
+            apt-get update -y > /dev/null
+            apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit > /dev/null
+            ;;
+        "rhel")
+            PKG_MANAGER=$(command -v dnf || command -v yum)
+            $PKG_MANAGER makecache > /dev/null
+            tee /etc/yum.repos.d/fluent-bit.repo > /dev/null <<'YUM_REPO_EOF'
+[fluent-bit]
+name = Fluent Bit
+baseurl = https://packages.fluentbit.io/centos/8/$basearch/
+gpgcheck=1
+gpgkey=https://packages.fluentbit.io/fluentbit.key
+enabled=1
+YUM_REPO_EOF
+            $PKG_MANAGER install -y python3 python3-pip curl net-tools fluent-bit > /dev/null
+            ;;
+    esac
     pip3 install --break-system-packages psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 > /dev/null
-    echo "    - Dependencies installed (including net-tools)."
+    echo "    - Dependencies installed."
 }
 
 function setup_agent_user_and_dirs() {
-    echo "--> [2/5] Setting up user and directories..."
+    echo "--> [3/8] Setting up user and directories..."
     if ! id -u "$AGENT_USER" >/dev/null 2>&1; then
         useradd --system --shell /usr/sbin/nologin "$AGENT_USER"
         echo "    - Created system user '$AGENT_USER'"
@@ -58,537 +129,317 @@ function setup_agent_user_and_dirs() {
     usermod -a -G adm,systemd-journal ${AGENT_USER}
     echo "    - Granted '$AGENT_USER' read access to system logs."
     
-    mkdir -p "$AGENT_DIR"
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$STATE_DIR"
-
-    chown -R "$AGENT_USER":"$AGENT_USER" "$AGENT_DIR"
-    chown -R "$AGENT_USER":"$AGENT_USER" "$CONFIG_DIR"
-    chown -R "$AGENT_USER":"$AGENT_USER" "$STATE_DIR"
-
-    chmod 750 "$AGENT_DIR"
-    chmod 750 "$CONFIG_DIR"
-    chmod 750 "$STATE_DIR"
+    mkdir -p "$AGENT_DIR" "$CONFIG_DIR" "$STATE_DIR"
+    chown -R "$AGENT_USER":"$AGENT_USER" "$AGENT_DIR" "$CONFIG_DIR" "$STATE_DIR"
+    chmod 750 "$AGENT_DIR" "$CONFIG_DIR" "$STATE_DIR"
 }
 
+function configure_fluent_bit() {
+    echo "--> [4/8] Configuring Fluent Bit for structured log collection..."
+
+    tee "/etc/fluent-bit/fluent-bit.conf" > /dev/null <<'FLUENTBIT_MAIN_EOF'
+[SERVICE]
+    Flush           5
+    Daemon          Off
+    Log_Level       info
+    Parsers_File    noirnote-parsers.conf
+    @INCLUDE        conf.d/*.conf
+FLUENTBIT_MAIN_EOF
+
+    mkdir -p "$FLUENTBIT_CONF_DIR"
+
+    tee "$NOIRNOTE_FLUENTBIT_CONF" > /dev/null <<'FLUENTBIT_NOIRNOTE_EOF'
+[INPUT]
+    Name            systemd
+    Tag             noirnote.host.*
+    Systemd_Filter  _SYSTEMD_UNIT
+[INPUT]
+    Name            tail
+    Tag             noirnote.nginx.error
+    Path            /var/log/nginx/error.log*
+    Parser          nginx_error
+    Multiline.parser  docker, cri
+[INPUT]
+    Name            tail
+    Tag             noirnote.apache.error
+    Path            /var/log/apache2/error.log*
+    Multiline.parser  docker, cri
+[INPUT]
+    Name            tail
+    Tag             noirnote.httpd.error
+    Path            /var/log/httpd/error_log*
+    Multiline.parser  docker, cri
+[INPUT]
+    Name            tail
+    Tag             noirnote.postgres.log
+    Path            /var/log/postgresql/*.log
+    Parser          postgres_log
+[OUTPUT]
+    Name            file
+    Match           noirnote.*
+    Path            /var/lib/noirnote-agent/structured_logs.json
+    Format          json_lines
+FLUENTBIT_NOIRNOTE_EOF
+
+    tee "$NOIRNOTE_PARSERS_CONF" > /dev/null <<'FLUENTBIT_PARSERS_EOF'
+[PARSER]
+    Name   nginx_error
+    Format regex
+    Regex  ^(?<time>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(?<level>\w+)\] (?<pid>\d+#\d+): (?<tid>\*\d+)?(?<message>.*)$
+[PARSER]
+    Name   postgres_log
+    Format regex
+    Regex  ^(?<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.\d+ \w+)\s\[(?<pid>\d+)\]\s(?<message>.*)$
+FLUENTBIT_PARSERS_EOF
+
+    echo "    - Fluent Bit configured for multi-OS log paths."
+}
+
+function configure_custom_integrations() {
+    echo "--> [5/8] Configuring Custom Integrations..."
+    if [ ! -f "$USER_INTEGRATIONS_CONFIG_PATH" ]; then
+        echo "    - No custom integrations file found at '$USER_INTEGRATIONS_CONFIG_PATH'. Skipping."
+        # Ensure an empty file exists so it can be reloaded if created later
+        touch "$NOIRNOTE_CUSTOM_FLUENTBIT_CONF"
+        return
+    fi
+    
+    echo "    - Found custom integrations file. Generating Fluent Bit config..."
+    
+    # Use awk to parse the [logs] section
+    # This captures lines between "[logs]" and the next section "[...]" or EOF
+    awk '
+        BEGIN { printing = 0 }
+        /^\[logs\]$/ { printing = 1; next }
+        /^\[.*\]$/ { printing = 0 }
+        printing && /=/ { print }
+    ' "$USER_INTEGRATIONS_CONFIG_PATH" | while IFS='=' read -r name path; do
+        # Trim whitespace
+        name=$(echo "$name" | xargs)
+        path=$(echo "$path" | xargs)
+        
+        if [ -n "$name" ] && [ -n "$path" ]; then
+            echo "    - Adding custom log: '$name' at '$path'"
+            # Append a new INPUT block to the custom config file
+            tee -a "$NOIRNOTE_CUSTOM_FLUENTBIT_CONF" > /dev/null <<EOF
+[INPUT]
+    Name            tail
+    Tag             noirnote.custom.${name}
+    Path            ${path}
+    Multiline.parser  docker, cri
+
+EOF
+        fi
+    done
+
+    if [ ! -s "$NOIRNOTE_CUSTOM_FLUENTBIT_CONF" ]; then
+        echo "    - No valid log entries found in '$USER_INTEGRATIONS_CONFIG_PATH'."
+    else
+        echo "    - Custom Fluent Bit configuration created at '$NOIRNOTE_CUSTOM_FLUENTBIT_CONF'."
+    fi
+}
+
+
 function create_agent_script() {
-    echo "--> [3/5] Creating agent script at ${AGENT_SCRIPT_PATH}..."
-    # The full agent code with state snapshot reporting is embedded here.
+    echo "--> [6/8] Creating agent script at ${AGENT_SCRIPT_PATH}..."
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
-# agent/noirnote_agent.py
-import psutil
-import requests
-import json
-import time
-import os
-import traceback
-import re
-import platform
-import subprocess
-import glob
+# agent/noirnote_agent.py (Multi-OS v9 with restored features)
+import psutil, requests, json, time, os, traceback, re, platform, subprocess, glob
 from datetime import datetime
 from google.oauth2 import service_account
 import google.auth.transport.requests
 
-# --- Configuration ---
 CONFIG_FILE_PATH = "/etc/noirnote/agent.conf"
 KEY_FILE_PATH = "/etc/noirnote/agent-key.json"
 STATE_FILE_PATH = "/var/lib/noirnote-agent/state.json"
-# Task 1: Define the Optional Configuration Path
+STRUCTURED_LOG_PATH = "/var/lib/noirnote-agent/structured_logs.json"
 USER_INTEGRATIONS_CONFIG_PATH = "/etc/noirnote/integrations.conf"
 
-# --- State for calculating rates ---
-last_net_io = psutil.net_io_counters()
-last_disk_io = psutil.disk_io_counters()
-last_time = time.time()
+last_net_io, last_disk_io, last_time = psutil.net_io_counters(), psutil.disk_io_counters(), time.time()
 
 INTEGRATION_KNOWLEDGE_MAP = {
-    "nginx": {
-        "log_paths": ["/var/log/nginx/error.log*", "/var/log/nginx/error.log"],
-        "config_paths": ["/etc/nginx/nginx.conf"],
-        "version_command": "nginx -v",
-        "pid_path": "/var/run/nginx.pid"
-    },
-    "postgres": {
-        "log_paths": ["/var/log/postgresql/postgresql-*.log"],
-        "config_paths": ["/etc/postgresql/*/main/postgresql.conf"],
-        "version_command": "psql --version",
-        "pid_path": "/var/run/postgresql/*.pid" # Varies by version
-    },
-    "httpd": {
-        "log_paths": ["/var/log/httpd/error_log"],
-        "config_paths": ["/etc/httpd/conf/httpd.conf"],
-        "version_command": "httpd -v",
-        "pid_path": "/var/run/httpd/httpd.pid"
-    },
-    "apache2": {
-        "log_paths": ["/var/log/apache2/error.log"],
-        "config_paths": ["/etc/apache2/apache2.conf"],
-        "version_command": "apache2 -v",
-        "pid_path": "/var/run/apache2/apache2.pid"
-    },
-    "mysqld": {
-        "log_paths": ["/var/log/mysql/error.log", "/var/log/mysqld.log"],
-        "config_paths": ["/etc/mysql/my.cnf", "/etc/my.cnf"],
-        "version_command": "mysql --version",
-        "pid_path": "/var/run/mysqld/mysqld.pid"
-    },
-    "redis-server": {
-        "log_paths": ["/var/log/redis/redis-server.log"],
-        "config_paths": ["/etc/redis/redis.conf"],
-        "version_command": "redis-server --version",
-        "pid_path": "/var/run/redis/redis-server.pid"
-    }
+    "nginx": {"config_paths": ["/etc/nginx/nginx.conf"], "version_command": "nginx -v", "pid_path": "/var/run/nginx.pid"},
+    "postgres": {"config_paths": ["/etc/postgresql/*/main/postgresql.conf"], "version_command": "psql --version", "pid_path": "/var/run/postgresql/*.pid"},
+    "httpd": {"config_paths": ["/etc/httpd/conf/httpd.conf"], "version_command": "httpd -v", "pid_path": "/var/run/httpd/httpd.pid"},
+    "apache2": {"config_paths": ["/etc/apache2/apache2.conf"], "version_command": "apache2 -v", "pid_path": "/var/run/apache2/apache2.pid"},
+    "mysqld": {"config_paths": ["/etc/mysql/my.cnf", "/etc/my.cnf"], "version_command": "mysql --version", "pid_path": "/var/run/mysqld/mysqld.pid"},
+    "redis-server": {"config_paths": ["/etc/redis/redis.conf"], "version_command": "redis-server --version", "pid_path": "/var/run/redis/redis-server.pid"}
 }
 
-
-# --- State Management Functions ---
 def load_state():
     if not os.path.exists(STATE_FILE_PATH): return {}
     try:
         with open(STATE_FILE_PATH, 'r') as f: return json.load(f)
-    except (json.JSONDecodeError, IOError, PermissionError) as e:
-        print(f"WARN: Could not load state from {STATE_FILE_PATH}, starting fresh. Error: {e}")
-        return {}
+    except (json.JSONDecodeError, IOError, PermissionError): return {}
 
 def save_state(state):
     try:
         with open(STATE_FILE_PATH, 'w') as f: json.dump(state, f, indent=2)
-    except (IOError, PermissionError) as e:
-        print(f"ERROR: Could not save state to {STATE_FILE_PATH}: {e}")
+    except (IOError, PermissionError): pass
 
-# Task 2: Implement the Configuration Loader
 def load_user_integrations():
-    """
-    Loads custom log and config paths from an optional user-defined file.
-    The file format is a simple .ini style with [logs] and [configs] sections.
-    """
     empty_integrations = {"logs": [], "configs": []}
-    
-    if not os.path.exists(USER_INTEGRATIONS_CONFIG_PATH):
-        return empty_integrations
-
+    if not os.path.exists(USER_INTEGRATIONS_CONFIG_PATH): return empty_integrations
     integrations = {"logs": [], "configs": []}
     try:
         with open(USER_INTEGRATIONS_CONFIG_PATH, 'r') as f:
             current_section = None
             for line in f:
                 line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                
+                if not line or line.startswith('#'): continue
                 if line.startswith('[') and line.endswith(']'):
                     current_section = line[1:-1].lower()
                     continue
-
                 if current_section and '=' in line:
                     key, value = line.split('=', 1)
-                    name = key.strip()
-                    path = value.strip()
-                    
-                    if not name or not path:
-                        print(f"WARN: Skipping malformed entry in {USER_INTEGRATIONS_CONFIG_PATH}: {line}")
-                        continue
-                    
                     if current_section in integrations:
-                        integrations[current_section].append({"name": name, "path": path})
-
-    except (IOError, PermissionError) as e:
-        print(f"WARN: Could not read user integrations file at {USER_INTEGRATIONS_CONFIG_PATH}. Error: {e}")
-        return empty_integrations
-
+                        integrations[current_section].append({"name": key.strip(), "path": value.strip()})
+    except (IOError, PermissionError): return empty_integrations
     return integrations
 
-# --- Helper Functions ---
 def _run_command(command):
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=20, check=False
-        )
-        if result.returncode != 0:
-            error_output = (result.stdout.strip() + " " + result.stderr.strip()).strip()
-            return f"Error executing command '{command}': [Exit Code {result.returncode}] {error_output}"
-        return result.stdout.strip()
-    except Exception as e:
-        return f"An unexpected error occurred while running '{command}': {e}"
-
-def get_dmesg_output():
-    return _run_command("dmesg -T")
-
-def get_netstat_output():
-    return _run_command("netstat -tulnp")
-
-def get_syslog_snippet():
-    if os.path.exists('/bin/journalctl'):
-        return _run_command("journalctl -n 200 --no-pager")
-    elif os.path.exists('/var/log/syslog'):
-        return _run_command("tail -n 200 /var/log/syslog")
-    return "Neither journalctl nor /var/log/syslog found."
-
-def get_log_snippet(path):
-    if os.path.exists(path):
-        return _run_command(f"tail -n 200 {path}")
-    return ""
+        return subprocess.run(command, shell=True, capture_output=True, text=True, timeout=20, check=False).stdout.strip()
+    except Exception: return ""
 
 def _read_pid_from_file(pid_path_pattern):
-    """Safely reads a PID from a file, handling globs and errors."""
     try:
-        # Use glob to find the actual PID file path
         pid_files = glob.glob(pid_path_pattern)
-        if not pid_files:
-            return None
-        with open(pid_files[0], 'r') as f:
-            return int(f.read().strip())
-    except (IOError, PermissionError, ValueError, IndexError):
-        return None
+        if not pid_files: return None
+        with open(pid_files[0], 'r') as f: return int(f.read().strip())
+    except (IOError, PermissionError, ValueError, IndexError): return None
 
-# --- State Snapshot Collection ---
+def get_structured_dmesg():
+    output = _run_command("dmesg -T")
+    pattern = re.compile(r'\[\s*([^\]]+)\]\s*(.*)')
+    return [{"timestamp": m.group(1).strip(), "message": m.group(2).strip()} for line in output.splitlines() if (m := pattern.match(line))]
+
+def get_ss_listeners():
+    output = _run_command("ss -tulpn")
+    listeners = []
+    for line in output.splitlines()[1:]:
+        try:
+            parts = line.split()
+            match = re.search(r'users:\(\("([^"]+)",pid=(\d+),', parts[-1])
+            proc_name, pid = (match.group(1), int(match.group(2))) if match else (None, None)
+            listeners.append({"protocol": parts[0], "state": parts[1], "local_address": parts[4], "process_name": proc_name, "pid": pid})
+        except (IndexError, ValueError): continue
+    return listeners
+
+def get_version_info(command):
+    raw = _run_command(command)
+    match = re.search(r'(\d+\.\d+\.\d+)', raw)
+    return {"version": match.group(1) if match else None, "raw": raw}
+
 def collect_state_snapshot(discovered_services: list):
-    """Orchestrates the collection of a comprehensive, correlated state snapshot."""
-    print("--> Collecting state snapshot...")
-    snapshot = {}
-    system = platform.system()
-
-    if system == "Linux":
-        snapshot['dmesg'] = get_dmesg_output()
-        snapshot['netstat'] = get_netstat_output()
-        snapshot['syslog_snippet'] = get_syslog_snippet()
-        snapshot['messages_log_snippet'] = get_log_snippet('/var/log/messages')
-        snapshot['kern_log_snippet'] = get_log_snippet('/var/log/kern.log')
-        snapshot['auth_log_snippet'] = get_log_snippet('/var/log/auth.log') or get_log_snippet('/var/log/secure')
+    snapshot = { 'dmesg_events': get_structured_dmesg(), 'network_listeners': get_ss_listeners(), 'versions': {}, 'configs': {} }
+    for service in discovered_services:
+        k = INTEGRATION_KNOWLEDGE_MAP.get(service, {})
+        if k.get("version_command"): snapshot['versions'][service] = get_version_info(k["version_command"])
+        pid = _read_pid_from_file(k["pid_path"]) if k.get("pid_path") else None
         
-        snapshot['versions'] = {}
-        snapshot['configs'] = {}
-
-        # Snapshot auto-discovered services
-        print(f"--> Snapshotting discovered services: {discovered_services}")
-        for service in discovered_services:
-            knowledge = INTEGRATION_KNOWLEDGE_MAP.get(service, {})
-            
-            if knowledge.get("version_command"):
-                snapshot['versions'][service] = _run_command(knowledge["version_command"])
-            
-            pid = None
-            if knowledge.get("pid_path"):
-                pid = _read_pid_from_file(knowledge["pid_path"])
-
-            config_content = "Config path not found or not readable."
-            for config_pattern in knowledge.get("config_paths", []):
-                for config_path in glob.glob(config_pattern):
+        config_content = "Config path not found or not readable."
+        if "config_paths" in k:
+            for path_pattern in k["config_paths"]:
+                for path in glob.glob(path_pattern):
                     try:
-                        with open(config_path, 'r', errors='ignore') as f:
-                            config_content = f.read()
+                        with open(path, 'r', errors='ignore') as f: config_content = f.read()
                         break
-                    except (IOError, PermissionError) as e:
-                        config_content = f"Error reading {config_path}: {e}"
-                        break
-                if "Error" not in config_content and "not found" not in config_content:
-                    break
-            
-            snapshot['configs'][service] = {"pid": pid, "content": config_content}
+                    except (IOError, PermissionError, FileNotFoundError): continue
+                if "not found" not in config_content: break
+        snapshot['configs'][service] = {"pid": pid, "content": config_content}
 
-        # Task 4: Integrate User Config into State Snapshot Collection
-        user_integrations = load_user_integrations()
-        user_configs = user_integrations.get("configs", [])
-        if user_configs:
-            print(f"--> Snapshotting user-defined configurations...")
-            for custom_config in user_configs:
-                content = f"File not found or not readable at {custom_config['path']}"
-                try:
-                    with open(custom_config['path'], 'r', errors='ignore') as f:
-                        content = f.read()
-                except (IOError, PermissionError) as e:
-                    content = f"Error reading {custom_config['path']}: {e}"
-                
-                # Add to snapshot using user-defined name as key
-                snapshot['configs'][custom_config['name']] = {"pid": None, "content": content}
+    user_integrations = load_user_integrations()
+    for custom_config in user_integrations.get("configs", []):
+        content = f"File not found or not readable at {custom_config['path']}"
+        try:
+            with open(custom_config['path'], 'r', errors='ignore') as f: content = f.read()
+        except (IOError, PermissionError) as e: content = f"Error reading {custom_config['path']}: {e}"
+        snapshot['configs'][custom_config['name']] = {"pid": None, "content": content}
 
-    print("--> State snapshot collection complete.")
     return snapshot
 
-# --- Event Collection ---
-def _read_new_log_lines(log_path, state):
-    new_lines = []
-    if not os.path.exists(log_path) or not os.path.isfile(log_path): return new_lines
+def _read_new_lines_from_file(path, state):
+    lines, key = [], f"log_{path}"
+    if not os.path.exists(path): return lines
     try:
-        current_inode = os.stat(log_path).st_ino
-    except (FileNotFoundError, PermissionError): return new_lines
-    
-    log_state_key = f"log_{log_path}"
-    log_state = state.get(log_state_key, {})
-    last_inode, last_offset = log_state.get('inode'), log_state.get('offset', 0)
-    if current_inode != last_inode: last_offset = 0
+        inode = os.stat(path).st_ino
+        log_state = state.get(key, {})
+        offset = log_state.get('offset', 0) if log_state.get('inode') == inode else 0
+        with open(path, 'rb') as f:
+            f.seek(offset)
+            lines = [line.decode('utf-8', 'ignore').strip() for line in f.readlines()]
+            state[key] = {'inode': inode, 'offset': f.tell()}
+    except (IOError, PermissionError, FileNotFoundError): pass
+    return lines
 
-    try:
-        with open(log_path, 'rb') as f:
-            f.seek(last_offset)
-            new_lines = [line.decode('utf-8', 'ignore').strip() for line in f.readlines()]
-            state[log_state_key] = {'inode': current_inode, 'offset': f.tell()}
-    except (IOError, PermissionError): pass
-    return new_lines
+def collect_events(state):
+    return [json.loads(line) for line in _read_new_lines_from_file(STRUCTURED_LOG_PATH, state) if line]
 
-def _create_event(event_type, summary, pid=None):
-    """Standardizes event creation, now with optional PID."""
-    event = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "event_type": event_type,
-        "summary": summary
-    }
-    if pid:
-        try:
-            event["pid"] = int(pid)
-        except (ValueError, TypeError):
-            pass # Ignore if PID is not a valid integer
-    return event
-
-def parse_auth_log(state):
-    events = []
-    log_file = '/var/log/auth.log' if os.path.exists('/var/log/auth.log') else '/var/log/secure'
-    patterns = {
-        'USER_LOGIN': re.compile(r'sshd(?:\[(\d+)\])?:\s*session opened for user (\w+)'),
-        'FAILED_LOGIN': re.compile(r'sshd(?:\[(\d+)\])?:\s*Failed password for.*?(\w+) from ([\d.]+)')
-    }
-    for line in _read_new_log_lines(log_file, state):
-        for event_type, pattern in patterns.items():
-            match = pattern.search(line)
-            if match:
-                pid = match.group(1)
-                if event_type == 'USER_LOGIN':
-                    summary = f"User '{match.group(2)}' logged in via SSH"
-                    events.append(_create_event(event_type, summary, pid))
-                elif event_type == 'FAILED_LOGIN':
-                    summary = f"Failed password for '{match.group(2)}' from {match.group(3)}"
-                    events.append(_create_event(event_type, summary, pid))
-    return events
-
-def parse_syslog_and_kern(state):
-    events = []
-    log_files = ['/var/log/syslog', '/var/log/messages', '/var/log/kern.log']
-    line_pattern = re.compile(r'\S+\s+\d+\s+\S+\s+([\w\d\._-]+)(?:\[(\d+)\])?:\s*(.*)')
-    
-    for log_file in log_files:
-        for line in _read_new_log_lines(log_file, state):
-            match = line_pattern.search(line)
-            pid, message = (match.group(2), match.group(3)) if match else (None, line)
-            
-            if "oom-killer" in message.lower() or "out of memory" in message.lower():
-                summary = (message[:250] + '...') if len(message) > 253 else message
-                events.append(_create_event('OOM_KILLER_INVOKED', summary, pid))
-                continue
-
-            keywords = ['error', 'failed', 'fatal', 'segfault', 'panic', 'critical']
-            if any(keyword in message.lower() for keyword in keywords):
-                event_type = 'KERNEL_ERROR' if 'kern.log' in log_file else 'SYSTEM_ERROR'
-                summary = (message[:250] + '...') if len(message) > 253 else message
-                events.append(_create_event(event_type, summary, pid))
-    return events
-
-def check_systemd_failures(state):
-    """Checks for services in a failed state using systemctl."""
-    events = []
-    command_output = _run_command("systemctl --failed --no-legend --plain")
-    if not command_output or command_output.startswith("Error"):
-        return events
-
-    state_key = "reported_systemd_failures"
-    if state_key not in state:
-        state[state_key] = []
-        
-    current_failed_services = {line.split()[0] for line in command_output.strip().splitlines()}
-    newly_failed_services = current_failed_services - set(state[state_key])
-
-    for service_name in newly_failed_services:
-        summary = f"[systemd] Service '{service_name}' entered failed state."
-        events.append(_create_event('SERVICE_FAILURE', summary))
-        state[state_key].append(service_name)
-
-    state[state_key] = [s for s in state[state_key] if s in current_failed_services]
-    
-    return events
-
-def collect_events(state, discovered_services: list):
-    """Gathers all system and application events from various sources."""
-    all_events = []
-    print("--> Collecting events...")
-    system = platform.system()
-    if system == "Linux":
-        all_events.extend(parse_auth_log(state))
-        all_events.extend(parse_syslog_and_kern(state))
-        all_events.extend(check_systemd_failures(state))
-        
-        # Collect from auto-discovered services
-        print(f"--> Checking logs for discovered services: {discovered_services}")
-        for service in discovered_services:
-            knowledge = INTEGRATION_KNOWLEDGE_MAP.get(service, {})
-            for log_pattern in knowledge.get("log_paths", []):
-                for log_path in glob.glob(log_pattern):
-                    for line in _read_new_log_lines(log_path, state):
-                        summary = f"[{service}] {line}"
-                        summary = (summary[:250] + '...') if len(summary) > 253 else summary
-                        all_events.append(_create_event('APPLICATION_LOG', summary))
-
-        # Task 3: Integrate User Config into Event Collection
-        user_integrations = load_user_integrations()
-        user_logs = user_integrations.get("logs", [])
-        if user_logs:
-            print(f"--> Checking logs for user-defined integrations...")
-            for custom_log in user_logs:
-                for line in _read_new_log_lines(custom_log['path'], state):
-                    summary = f"[{custom_log['name']}] {line}"
-                    summary = (summary[:250] + '...') if len(summary) > 253 else summary
-                    all_events.append(_create_event('APPLICATION_LOG', summary))
-
-    if all_events:
-        print(f"--> Collected {len(all_events)} new events.")
-    return all_events
-
-# --- Metrics Collection ---
-def collect_all_metrics() -> (dict, list):
-    """Gathers granular system metrics and discovers running services."""
+def collect_all_metrics():
     global last_net_io, last_disk_io, last_time
-    print("--> Collecting granular metrics and discovering services...")
+    now, elapsed = time.time(), 1.0
+    if now > last_time: elapsed = now - last_time
+    net, disk = psutil.net_io_counters(), psutil.disk_io_counters()
     
-    cpu_times = psutil.cpu_times_percent(interval=1, percpu=False)
-    cpu_states = {
-        "user": cpu_times.user,
-        "system": cpu_times.system,
-        "idle": cpu_times.idle,
-        "iowait": cpu_times.iowait
-    }
+    procs, services = [], set()
+    for p in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent', 'memory_percent']):
+        try:
+            info = p.info
+            procs.append(info)
+            if info['name'] in INTEGRATION_KNOWLEDGE_MAP: services.add(info['name'])
+        except (psutil.NoSuchProcess, psutil.AccessDenied): continue
 
-    vmem = psutil.virtual_memory()
-    swap = psutil.swap_memory()
-    memory_details = {
-        "total": vmem.total,
-        "available": vmem.available,
-        "used": vmem.used,
-        "cached": getattr(vmem, 'cached', 0),
-        "buffers": getattr(vmem, 'buffers', 0),
-        "swap_used_percent": swap.percent
-    }
-    
-    current_time = time.time()
-    elapsed_time = current_time - last_time
-    if elapsed_time <= 0: elapsed_time = 1
-    
-    current_disk_io = psutil.disk_io_counters()
-    disk_io = {
-        "read_ops_per_sec": (current_disk_io.read_count - last_disk_io.read_count) / elapsed_time,
-        "write_ops_per_sec": (current_disk_io.write_count - last_disk_io.write_count) / elapsed_time
-    }
-    
-    current_net_io = psutil.net_io_counters()
-    net_rate = {
-        "bytes_sent_per_sec": (current_net_io.bytes_sent - last_net_io.bytes_sent) / elapsed_time,
-        "bytes_recv_per_sec": (current_net_io.bytes_recv - last_net_io.bytes_recv) / elapsed_time
-    }
-    
     tcp_states = {"ESTABLISHED": 0, "TIME_WAIT": 0, "CLOSE_WAIT": 0}
     try:
         for conn in psutil.net_connections(kind='tcp'):
-            if conn.status in tcp_states:
-                tcp_states[conn.status] += 1
-    except psutil.AccessDenied:
-        print("WARN: Access denied for net_connections, TCP states will be empty.")
+            if conn.status in tcp_states: tcp_states[conn.status] += 1
+    except psutil.AccessDenied: pass
 
-    net_rate["tcp_connections"] = tcp_states
-    
-    last_disk_io = current_disk_io
-    last_net_io = current_net_io
-    last_time = current_time
-
-    procs, discovered_services = [], set()
-    for p in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent', 'memory_percent']):
-        try:
-            p_info = p.info
-            procs.append(p_info)
-            if p_info['name'] in INTEGRATION_KNOWLEDGE_MAP:
-                discovered_services.add(p_info['name'])
-        except (psutil.NoSuchProcess, psutil.AccessDenied): continue
-    top_procs = sorted(procs, key=lambda p: (p.get('cpu_percent', 0) or 0), reverse=True)
-    
     metrics = {
-        "cpu_states": cpu_states,
-        "memory_details": memory_details,
-        "disk_io": disk_io,
+        "cpu_states": psutil.cpu_times_percent()._asdict(),
+        "memory_details": psutil.virtual_memory()._asdict(),
+        "disk_io": {"reads_per_sec": (disk.read_count - last_disk_io.read_count) / elapsed, "writes_per_sec": (disk.write_count - last_disk_io.write_count) / elapsed},
         "disks": [{"device": p.device, "mountpoint": p.mountpoint, "percent": psutil.disk_usage(p.mountpoint).percent} for p in psutil.disk_partitions(all=False) if 'loop' not in p.device],
-        "processes": top_procs[:15],
-        "network": net_rate
+        "network": {"sent_per_sec": (net.bytes_sent - last_net_io.bytes_sent) / elapsed, "recv_per_sec": (net.bytes_recv - last_net_io.bytes_recv) / elapsed, "tcp_connections": tcp_states},
+        "processes": sorted(procs, key=lambda p: (p.get('cpu_percent', 0) or 0), reverse=True)[:15],
     }
-    
-    print(f"--> Metrics collection complete. Discovered services: {list(discovered_services)}")
-    return metrics, list(discovered_services)
+    last_net_io, last_disk_io, last_time = net, disk, now
+    return metrics, list(services)
 
-# --- Core Agent Logic ---
-def load_config():
-    config = {}
-    if not os.path.exists(CONFIG_FILE_PATH):
-        raise FileNotFoundError(f"FATAL: Config file not found at '{CONFIG_FILE_PATH}'")
-    with open(CONFIG_FILE_PATH, 'r') as f:
-        for line in f:
-            if '=' in line:
-                key, value = line.strip().split('=', 1)
-                config[key.strip()] = value.strip()
-    return config
-
-def get_service_account_credentials(key_path, target_audience):
-    try:
-        return service_account.IDTokenCredentials.from_service_account_file(key_path, target_audience=target_audience)
-    except Exception as e:
-        raise Exception(f"FATAL: Could not create service account credentials. Error: {e}")
-
-# --- Main Execution Loop ---
-if __name__ == "__main__":
-    print("Starting NoirNote Context-Aware Agent...")
-    try:
-        config = load_config()
-        credentials = get_service_account_credentials(KEY_FILE_PATH, config['INGEST_FUNCTION_URL'])
-    except Exception as e:
-        print(e); exit(1)
-        
-    print(f"Agent configured for server_id: {config.get('SERVER_ID', 'UNKNOWN')}")
+def main():
+    print("Starting NoirNote Agent v9...")
+    config = {k.strip(): v.strip() for line in open(CONFIG_FILE_PATH) if '=' in line for k, v in [line.strip().split('=', 1)]}
+    creds = service_account.IDTokenCredentials.from_service_account_file(KEY_FILE_PATH, target_audience=config['INGEST_FUNCTION_URL'])
     state = load_state()
-    authed_session = google.auth.transport.requests.Request()
-
+    session = google.auth.transport.requests.Request()
     while True:
         try:
-            metrics, discovered_services = collect_all_metrics()
-            events = collect_events(state, discovered_services)
-            state_snapshot = collect_state_snapshot(discovered_services)
-
+            metrics, services = collect_all_metrics()
             payload = {
-                "user_id": config['USER_ID'],
-                "workspace_id": config.get('WORKSPACE_ID', config['USER_ID']),
-                "server_id": config['SERVER_ID'],
-                "metrics": metrics,
-                "events": events,
-                "state": state_snapshot
+                "user_id": config['USER_ID'], "workspace_id": config.get('WORKSPACE_ID', config['USER_ID']), "server_id": config['SERVER_ID'],
+                "metrics": metrics, "events": collect_events(state), "state": collect_state_snapshot(services)
             }
-            
-            credentials.refresh(authed_session)
-            headers = {'Authorization': f'Bearer {credentials.token}', 'Content-Type': 'application/json'}
-            
-            print(f"Pushing full payload to {config['INGEST_FUNCTION_URL']}...")
-            response = requests.post(config['INGEST_FUNCTION_URL'], json=payload, headers=headers, timeout=30)
-            response.raise_for_status()
-            print(f"Successfully pushed payload. Status: {response.status_code}")
-
+            creds.refresh(session)
+            headers = {'Authorization': f'Bearer {creds.token}', 'Content-Type': 'application/json'}
+            resp = requests.post(config['INGEST_FUNCTION_URL'], json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            print(f"Successfully pushed payload. Status: {resp.status_code}")
             save_state(state)
-
-        except requests.exceptions.RequestException as e:
-            print(f"ERROR: Network error while pushing payload: {e}")
         except Exception as e:
             print(f"ERROR: An unhandled exception occurred in the main loop: {e}")
             traceback.print_exc()
-        
         time.sleep(int(config.get('INTERVAL_SECONDS', 60)))
+
+if __name__ == "__main__":
+    main()
 AGENT_EOF
     chown "$AGENT_USER":"$AGENT_USER" "$AGENT_SCRIPT_PATH"
     chmod 750 "$AGENT_SCRIPT_PATH"
 }
 
 function configure_agent() {
-    echo "--> [4/5] Configuring agent..."
+    echo "--> [7/8] Configuring agent..."
     TOKEN=""
     for arg in "$@"; do
         if [[ $arg == --token=* ]]; then TOKEN="${arg#*=}"; shift; fi
@@ -617,29 +468,29 @@ function configure_agent() {
         echo "    [ERROR] Claim response was incomplete."; exit 1
     fi
     
-    echo "    - Credentials claimed for server: '$SERVER_ID'"
-
     echo "$SERVICE_ACCOUNT_KEY_JSON" > "$KEY_FILE_PATH"
     chown "$AGENT_USER":"$AGENT_USER" "$KEY_FILE_PATH"
     chmod 400 "$KEY_FILE_PATH"
 
-    echo "SERVER_ID=$SERVER_ID" > "$CONFIG_FILE_PATH"
-    echo "USER_ID=$USER_ID" >> "$CONFIG_FILE_PATH"
-    echo "WORKSPACE_ID=$USER_ID" >> "$CONFIG_FILE_PATH"
-    echo "INGEST_FUNCTION_URL=$INGEST_URL" >> "$CONFIG_FILE_PATH"
-    echo "INTERVAL_SECONDS=60" >> "$CONFIG_FILE_PATH"
+    tee "$CONFIG_FILE_PATH" > /dev/null <<EOF
+SERVER_ID=$SERVER_ID
+USER_ID=$USER_ID
+WORKSPACE_ID=$USER_ID
+INGEST_FUNCTION_URL=$INGEST_URL
+INTERVAL_SECONDS=60
+EOF
     chown "$AGENT_USER":"$AGENT_USER" "$CONFIG_FILE_PATH"
     chmod 640 "$CONFIG_FILE_PATH"
-    echo "    - Configuration saved."
+    echo "    - Configuration saved for server: '$SERVER_ID'."
 }
 
 function setup_service() {
-    echo "--> [5/5] Setting up and starting systemd service..."
+    echo "--> [8/8] Setting up and starting systemd services..."
     tee "$AGENT_SERVICE_FILE" > /dev/null <<'SERVICE_EOF'
 [Unit]
-Description=NoirNote Context-Aware Agent
-After=network-online.target
-Wants=network-online.target
+Description=NoirNote Structured Data Agent
+After=network-online.target fluent-bit.service
+Wants=network-online.target fluent-bit.service
 
 [Service]
 Type=simple
@@ -655,20 +506,30 @@ WantedBy=multi-user.target
 SERVICE_EOF
     
     systemctl daemon-reload
+    systemctl enable fluent-bit.service
+    systemctl restart fluent-bit.service
     systemctl enable noirnote-agent.service
     systemctl restart noirnote-agent.service
     
     echo ""
     echo "--- Installation Complete! ---"
-    echo "The NoirNote agent is now running."
-    echo "To check its status, run: systemctl status noirnote-agent.service"
-    echo "To view live logs, run:    journalctl -u noirnote-agent.service -f"
+    echo "The NoirNote agent and Fluent Bit are now running."
+    echo "To check agent status:      systemctl status noirnote-agent.service"
+    echo "To check fluent-bit status: systemctl status fluent-bit.service"
+    echo "To view live agent logs:    journalctl -u noirnote-agent.service -f"
 }
 
 # --- Main Execution ---
-check_root
-install_dependencies
-setup_agent_user_and_dirs
-create_agent_script
-configure_agent "$@"
-setup_service
+main() {
+    check_root
+    detect_os
+    install_dependencies
+    setup_agent_user_and_dirs
+    configure_fluent_bit
+    configure_custom_integrations
+    create_agent_script
+    configure_agent "$@"
+    setup_service
+}
+
+main "$@"
