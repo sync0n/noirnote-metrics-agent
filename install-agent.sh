@@ -69,32 +69,51 @@ function install_dependencies() {
     echo "--> [2/8] Installing dependencies for $OS_FAMILY..."
     case "$OS_FAMILY" in
         "debian")
-            # Allow the first update to fail in case of pre-existing broken repos (like the one we're about to fix).
             echo "    - Updating package lists (ignoring potential errors from old repos)..."
             apt-get update -y > /dev/null 2>&1 || true
 
             apt-get install -y curl gpg lsb-release > /dev/null
             
-            # --- START: ROBUST REPOSITORY SETUP (UBUNTU 24.04+ COMPATIBLE) ---
-            CODENAME=$(lsb_release -sc)
-            # Fallback for non-LTS or very new versions like 'oracular'
-            case "$CODENAME" in
-              noble|jammy) # Supported LTS versions
-                REPO_CODENAME="$CODENAME"
-                ;;
-              *)
-                echo "    - Warning: Unsupported codename '$CODENAME'. Falling back to 'noble' (Ubuntu 24.04 LTS) for Fluent Bit repository."
-                REPO_CODENAME="noble"
-                ;;
-            esac
-            
-            # Use the new official method from the documentation. This will overwrite any old/bad fluentbit.list file.
+            # Source os-release to get the OS ID variable
+            . /etc/os-release
+
+            if [ "$ID" = "ubuntu" ]; then
+                # --- Ubuntu-Specific Logic ---
+                UBUNTU_VERSION=$(lsb_release -rs)
+                case "$UBUNTU_VERSION" in
+                  24.04|24.*) REPO_CODENAME="noble" ;;
+                  22.04|22.*) REPO_CODENAME="jammy" ;;
+                  20.04|20.*) REPO_CODENAME="focal" ;;
+                  *)    
+                    echo "    - Warning: Unsupported Ubuntu version '$UBUNTU_VERSION'. Falling back to 'noble' (24.04 LTS)."
+                    REPO_CODENAME="noble" 
+                    ;;
+                esac
+                REPO_PATH="ubuntu/${REPO_CODENAME}"
+
+            elif [ "$ID" = "debian" ]; then
+                # --- Debian-Specific Logic ---
+                DEBIAN_VERSION=$(lsb_release -rs)
+                case "$DEBIAN_VERSION" in
+                  12|12.*) REPO_CODENAME="bookworm" ;;
+                  11|11.*) REPO_CODENAME="bullseye" ;;
+                  *)
+                    echo "    - Warning: Unsupported Debian version '$DEBIAN_VERSION'. Falling back to 'bookworm' (Debian 12)."
+                    REPO_CODENAME="bookworm"
+                    ;;
+                esac
+                REPO_PATH="debian/${REPO_CODENAME}"
+            else
+                echo "    - Error: Unrecognized Debian-family OS: '$ID'. Cannot set up repository."
+                exit 1
+            fi
+
+            # --- Common Repository Setup ---
+            echo "    - Configuring Fluent Bit repository for ${REPO_PATH}..."
             mkdir -p /etc/apt/keyrings
             curl -s https://packages.fluentbit.io/fluentbit.key > /etc/apt/keyrings/fluentbit.asc
-            echo "deb [signed-by=/etc/apt/keyrings/fluentbit.asc] https://packages.fluentbit.io/ubuntu/${REPO_CODENAME} ${REPO_CODENAME} main" > /etc/apt/sources.list.d/fluentbit.list
-            # --- END: ROBUST REPOSITORY SETUP ---
+            echo "deb [signed-by=/etc/apt/keyrings/fluentbit.asc] https://packages.fluentbit.io/${REPO_PATH} ${REPO_CODENAME} main" > /etc/apt/sources.list.d/fluentbit.list
 
-            # Now, update again with the corrected repository list. This one must succeed.
             echo "    - Updating package lists again with the correct repository..."
             apt-get update -y > /dev/null
             apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit > /dev/null
