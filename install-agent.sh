@@ -1,40 +1,8 @@
-Of course. I have updated the new installer script to restore the requested functionalities, bringing back the data points you specified from the original version.
-
-Here are the key changes I've implemented:
-
-Installer Script (install-agent.sh) Changes:
-
-A new step, [5/8] Configuring Custom Integrations, has been added.
-
-This step checks for the existence of /etc/noirnote/integrations.conf.
-
-If found, it parses the [logs] section and dynamically creates a Fluent Bit configuration file at /etc/fluent-bit/conf.d/noirnote-custom.conf. This seamlessly integrates user-defined logs into the new Fluent Bit architecture.
-
-Step numbering and titles have been updated accordingly.
-
-Agent Script (noirnote_agent.py) Changes:
-
-Disk & TCP Metrics Restored: The collect_all_metrics function now collects disk partition usage and TCP connection state counts, adding them back to the metrics payload.
-
-PID in State Snapshot Restored: The INTEGRATION_KNOWLEDGE_MAP has been updated with pid_path information. The collect_state_snapshot function now reads the PID from the service's PID file and includes it with the configuration data.
-
-Custom Configs Restored: The collect_state_snapshot function now calls a restored load_user_integrations function to read configuration files specified in the [configs] section of /etc/noirnote/integrations.conf and adds them to the state snapshot.
-
-This updated version provides the best of both worlds: the robust, structured logging of the new architecture combined with the comprehensive data collection of the original.
-
-Here is the complete, updated install-agent.sh script:
-
-code
-Bash
-download
-content_copy
-expand_less
-
 #!/bin/bash
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-echo "--- NoirNote Agent Installer (Multi-OS v9 with Fluent Bit & Custom Integrations) ---"
+echo "--- NoirNote Agent Installer (Multi-OS v10 with Fluent Bit & Repo Fallback) ---"
 
 # --- Global Variables ---
 AGENT_USER="noirnote-agent"
@@ -94,8 +62,24 @@ function install_dependencies() {
         "debian")
             apt-get update -y > /dev/null
             apt-get install -y curl gpg lsb-release > /dev/null
+            
+            # --- START: ROBUST REPOSITORY SETUP ---
+            CODENAME=$(lsb_release -cs)
+            # Fallback for non-LTS or very new versions like 'oracular'
+            case "$CODENAME" in
+              noble|jammy) # Supported LTS versions
+                REPO_CODENAME="$CODENAME"
+                ;;
+              *)
+                echo "    - Warning: Unsupported codename '$CODENAME'. Falling back to 'noble' (Ubuntu 24.04 LTS) for Fluent Bit repository."
+                REPO_CODENAME="noble"
+                ;;
+            esac
+            
             curl -s https://packages.fluentbit.io/fluentbit.key | gpg --dearmor > /usr/share/keyrings/fluentbit-key.gpg
-            echo "deb [signed-by=/usr/share/keyrings/fluentbit-key.gpg] https://packages.fluentbit.io/ubuntu/$(lsb_release -cs) $(lsb_release -cs) main" > /etc/apt/sources.list.d/fluent-bit.list
+            echo "deb [signed-by=/usr/share/keyrings/fluentbit-key.gpg] https://packages.fluentbit.io/ubuntu/${REPO_CODENAME} ${REPO_CODENAME} main" > /etc/apt/sources.list.d/fluent-bit.list
+            # --- END: ROBUST REPOSITORY SETUP ---
+
             apt-get update -y > /dev/null
             apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit > /dev/null
             ;;
@@ -199,28 +183,23 @@ function configure_custom_integrations() {
     echo "--> [5/8] Configuring Custom Integrations..."
     if [ ! -f "$USER_INTEGRATIONS_CONFIG_PATH" ]; then
         echo "    - No custom integrations file found at '$USER_INTEGRATIONS_CONFIG_PATH'. Skipping."
-        # Ensure an empty file exists so it can be reloaded if created later
         touch "$NOIRNOTE_CUSTOM_FLUENTBIT_CONF"
         return
     fi
     
     echo "    - Found custom integrations file. Generating Fluent Bit config..."
     
-    # Use awk to parse the [logs] section
-    # This captures lines between "[logs]" and the next section "[...]" or EOF
     awk '
         BEGIN { printing = 0 }
         /^\[logs\]$/ { printing = 1; next }
         /^\[.*\]$/ { printing = 0 }
         printing && /=/ { print }
     ' "$USER_INTEGRATIONS_CONFIG_PATH" | while IFS='=' read -r name path; do
-        # Trim whitespace
         name=$(echo "$name" | xargs)
         path=$(echo "$path" | xargs)
         
         if [ -n "$name" ] && [ -n "$path" ]; then
             echo "    - Adding custom log: '$name' at '$path'"
-            # Append a new INPUT block to the custom config file
             tee -a "$NOIRNOTE_CUSTOM_FLUENTBIT_CONF" > /dev/null <<EOF
 [INPUT]
     Name            tail
@@ -239,15 +218,17 @@ EOF
     fi
 }
 
-
 function create_agent_script() {
     echo "--> [6/8] Creating agent script at ${AGENT_SCRIPT_PATH}..."
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
 # agent/noirnote_agent.py (Multi-OS v9 with restored features)
 import psutil, requests, json, time, os, traceback, re, platform, subprocess, glob
-from datetime import datetime
+from datetime import datetime, timezone
 from google.oauth2 import service_account
 import google.auth.transport.requests
+import base64
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
 
 CONFIG_FILE_PATH = "/etc/noirnote/agent.conf"
 KEY_FILE_PATH = "/etc/noirnote/agent-key.json"
@@ -265,6 +246,29 @@ INTEGRATION_KNOWLEDGE_MAP = {
     "mysqld": {"config_paths": ["/etc/mysql/my.cnf", "/etc/my.cnf"], "version_command": "mysql --version", "pid_path": "/var/run/mysqld/mysqld.pid"},
     "redis-server": {"config_paths": ["/etc/redis/redis.conf"], "version_command": "redis-server --version", "pid_path": "/var/run/redis/redis-server.pid"}
 }
+
+def encrypt_payload(plaintext_bytes: bytes, key: bytes) -> (str, str):
+    """
+    Encrypts a plaintext byte string using AES-GCM, returning base64-encoded
+    ciphertext+tag and nonce, matching the Go backend's expected format.
+    """
+    try:
+        cipher = AES.new(key, AES.MODE_GCM)
+        nonce = cipher.nonce # This is 12 bytes by default for PyCryptodome's GCM
+        ciphertext, tag = cipher.encrypt_and_digest(plaintext_bytes)
+        
+        # The Go service expects the tag appended to the ciphertext.
+        combined_ciphertext = ciphertext + tag
+        
+        # Return base64 encoded strings
+        return (
+            base64.b64encode(combined_ciphertext).decode('utf-8'),
+            base64.b64encode(nonce).decode('utf-8')
+        )
+    except Exception as e:
+        print(f"FATAL: Encryption failed: {e}")
+        traceback.print_exc()
+        raise
 
 def load_state():
     if not os.path.exists(STATE_FILE_PATH): return {}
@@ -408,23 +412,45 @@ def collect_all_metrics():
     return metrics, list(services)
 
 def main():
-    print("Starting NoirNote Agent v9...")
+    print("Starting NoirNote Agent v10 (E2EE Edition)...")
     config = {k.strip(): v.strip() for line in open(CONFIG_FILE_PATH) if '=' in line for k, v in [line.strip().split('=', 1)]}
+    
+    chronos_key_b64 = config.get('CHRONOS_ENCRYPTION_KEY')
+    if not chronos_key_b64:
+        print("FATAL: CHRONOS_ENCRYPTION_KEY not found in config. Agent cannot run.")
+        return
+    try:
+        chronos_key = base64.b64decode(chronos_key_b64)
+        if len(chronos_key) != 32: raise ValueError("Decoded key is not 32 bytes.")
+    except Exception as e:
+        print(f"FATAL: Could not decode CHRONOS_ENCRYPTION_KEY: {e}"); return
+
     creds = service_account.IDTokenCredentials.from_service_account_file(KEY_FILE_PATH, target_audience=config['INGEST_FUNCTION_URL'])
     state = load_state()
     session = google.auth.transport.requests.Request()
     while True:
         try:
             metrics, services = collect_all_metrics()
+            
+            data_to_encrypt = { "metrics": metrics, "events": collect_events(state), "state": collect_state_snapshot(services) }
+            plaintext_json_bytes = json.dumps(data_to_encrypt).encode('utf-8')
+            
+            encrypted_payload_b64, nonce_b64 = encrypt_payload(plaintext_json_bytes, chronos_key)
+            
             payload = {
-                "user_id": config['USER_ID'], "workspace_id": config.get('WORKSPACE_ID', config['USER_ID']), "server_id": config['SERVER_ID'],
-                "metrics": metrics, "events": collect_events(state), "state": collect_state_snapshot(services)
+                "user_id": config['USER_ID'],
+                "workspace_id": config.get('WORKSPACE_ID', config['USER_ID']),
+                "server_id": config['SERVER_ID'],
+                "encrypted_payload_b64": encrypted_payload_b64,
+                "nonce_b64": nonce_b64,
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
+
             creds.refresh(session)
             headers = {'Authorization': f'Bearer {creds.token}', 'Content-Type': 'application/json'}
             resp = requests.post(config['INGEST_FUNCTION_URL'], json=payload, headers=headers, timeout=30)
             resp.raise_for_status()
-            print(f"Successfully pushed payload. Status: {resp.status_code}")
+            print(f"Successfully pushed ENCRYPTED payload. Status: {resp.status_code}")
             save_state(state)
         except Exception as e:
             print(f"ERROR: An unhandled exception occurred in the main loop: {e}")
@@ -463,8 +489,9 @@ function configure_agent() {
     SERVICE_ACCOUNT_KEY_JSON=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.dumps(json.load(sys.stdin).get('serviceAccountKey'), indent=2))")
     USER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('userId', ''))")
     SERVER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('serverId', ''))")
+    CHRONOS_KEY=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('chronosKey', ''))")
     
-    if [ -z "$SERVICE_ACCOUNT_KEY_JSON" ] || [ -z "$USER_ID" ] || [ -z "$SERVER_ID" ]; then
+    if [ -z "$SERVICE_ACCOUNT_KEY_JSON" ] || [ -z "$USER_ID" ] || [ -z "$SERVER_ID" ] || [ -z "$CHRONOS_KEY" ]; then
         echo "    [ERROR] Claim response was incomplete."; exit 1
     fi
     
@@ -478,6 +505,7 @@ USER_ID=$USER_ID
 WORKSPACE_ID=$USER_ID
 INGEST_FUNCTION_URL=$INGEST_URL
 INTERVAL_SECONDS=60
+CHRONOS_ENCRYPTION_KEY=$CHRONOS_KEY
 EOF
     chown "$AGENT_USER":"$AGENT_USER" "$CONFIG_FILE_PATH"
     chmod 640 "$CONFIG_FILE_PATH"
@@ -506,8 +534,8 @@ WantedBy=multi-user.target
 SERVICE_EOF
     
     systemctl daemon-reload
-    systemctl enable fluent-bit.service
-    systemctl restart fluent-bit.service
+    systemctl enable fluent-bit.service || echo "Warning: Could not enable fluent-bit service."
+    systemctl restart fluent-bit.service || echo "Warning: Could not restart fluent-bit service."
     systemctl enable noirnote-agent.service
     systemctl restart noirnote-agent.service
     
@@ -533,3 +561,4 @@ main() {
 }
 
 main "$@"
+Next Steps
