@@ -2,7 +2,7 @@
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-echo "--- NoirNote Agent Installer (Multi-OS v10 with Fluent Bit & Repo Fallback) ---"
+echo "--- NoirNote Agent Installer (Multi-OS v11 with Cleanup Logic) ---"
 
 # --- Global Variables ---
 AGENT_USER="noirnote-agent"
@@ -37,6 +37,18 @@ function check_root() {
     fi
 }
 
+function cleanup_first() {
+    echo "--> [Pre-flight] Performing cleanup for re-installation..."
+    # Stop the services if they are running to prevent file locks
+    systemctl stop noirnote-agent.service >/dev/null 2>&1 || true
+    systemctl stop fluent-bit.service >/dev/null 2>&1 || true
+    echo "    - Stopped existing services (if any)."
+
+    # Remove the custom integrations config file to ensure it's cleanly regenerated
+    rm -f "$NOIRNOTE_CUSTOM_FLUENTBIT_CONF"
+    echo "    - Removed old custom log configuration to prevent duplicates."
+}
+
 function detect_os() {
     echo "--> [1/8] Detecting operating system..."
     if [ -f /etc/os-release ]; then
@@ -63,11 +75,9 @@ function install_dependencies() {
             apt-get update -y > /dev/null
             apt-get install -y curl gpg lsb-release > /dev/null
             
-            # --- START: ROBUST REPOSITORY SETUP ---
             CODENAME=$(lsb_release -cs)
-            # Fallback for non-LTS or very new versions like 'oracular'
             case "$CODENAME" in
-              noble|jammy) # Supported LTS versions
+              noble|jammy)
                 REPO_CODENAME="$CODENAME"
                 ;;
               *)
@@ -78,7 +88,6 @@ function install_dependencies() {
             
             curl -s https://packages.fluentbit.io/fluentbit.key | gpg --dearmor > /usr/share/keyrings/fluentbit-key.gpg
             echo "deb [signed-by=/usr/share/keyrings/fluentbit-key.gpg] https://packages.fluentbit.io/ubuntu/${REPO_CODENAME} ${REPO_CODENAME} main" > /etc/apt/sources.list.d/fluent-bit.list
-            # --- END: ROBUST REPOSITORY SETUP ---
 
             apt-get update -y > /dev/null
             apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit > /dev/null
@@ -221,7 +230,7 @@ EOF
 function create_agent_script() {
     echo "--> [6/8] Creating agent script at ${AGENT_SCRIPT_PATH}..."
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
-# agent/noirnote_agent.py (Multi-OS v9 with restored features)
+# agent/noirnote_agent.py (Multi-OS v11 with E2EE)
 import psutil, requests, json, time, os, traceback, re, platform, subprocess, glob
 from datetime import datetime, timezone
 from google.oauth2 import service_account
@@ -254,13 +263,9 @@ def encrypt_payload(plaintext_bytes: bytes, key: bytes) -> (str, str):
     """
     try:
         cipher = AES.new(key, AES.MODE_GCM)
-        nonce = cipher.nonce # This is 12 bytes by default for PyCryptodome's GCM
+        nonce = cipher.nonce
         ciphertext, tag = cipher.encrypt_and_digest(plaintext_bytes)
-        
-        # The Go service expects the tag appended to the ciphertext.
         combined_ciphertext = ciphertext + tag
-        
-        # Return base64 encoded strings
         return (
             base64.b64encode(combined_ciphertext).decode('utf-8'),
             base64.b64encode(nonce).decode('utf-8')
@@ -412,7 +417,7 @@ def collect_all_metrics():
     return metrics, list(services)
 
 def main():
-    print("Starting NoirNote Agent v10 (E2EE Edition)...")
+    print("Starting NoirNote Agent v11 (E2EE Edition)...")
     config = {k.strip(): v.strip() for line in open(CONFIG_FILE_PATH) if '=' in line for k, v in [line.strip().split('=', 1)]}
     
     chronos_key_b64 = config.get('CHRONOS_ENCRYPTION_KEY')
@@ -542,23 +547,4 @@ SERVICE_EOF
     echo ""
     echo "--- Installation Complete! ---"
     echo "The NoirNote agent and Fluent Bit are now running."
-    echo "To check agent status:      systemctl status noirnote-agent.service"
-    echo "To check fluent-bit status: systemctl status fluent-bit.service"
-    echo "To view live agent logs:    journalctl -u noirnote-agent.service -f"
-}
-
-# --- Main Execution ---
-main() {
-    check_root
-    detect_os
-    install_dependencies
-    setup_agent_user_and_dirs
-    configure_fluent_bit
-    configure_custom_integrations
-    create_agent_script
-    configure_agent "$@"
-    setup_service
-}
-
-main "$@"
-Next Steps
+    echo "To check agent status:      systemctl
