@@ -74,9 +74,11 @@ function install_dependencies() {
 
             apt-get install -y curl gpg lsb-release > /dev/null
             
+            # Source os-release to get the OS ID variable
             . /etc/os-release
 
             if [ "$ID" = "ubuntu" ]; then
+                # --- Ubuntu-Specific Logic ---
                 UBUNTU_VERSION=$(lsb_release -rs)
                 case "$UBUNTU_VERSION" in
                   24.04|24.*) REPO_CODENAME="noble" ;;
@@ -90,6 +92,7 @@ function install_dependencies() {
                 REPO_PATH="ubuntu/${REPO_CODENAME}"
 
             elif [ "$ID" = "debian" ]; then
+                # --- Debian-Specific Logic ---
                 DEBIAN_VERSION=$(lsb_release -rs)
                 case "$DEBIAN_VERSION" in
                   12|12.*) REPO_CODENAME="bookworm" ;;
@@ -104,13 +107,11 @@ function install_dependencies() {
                 echo "    - Error: Unrecognized Debian-family OS: '$ID'. Cannot set up repository."
                 exit 1
             fi
-            
-            # --- START OF THE FIX ---
-            # Proactively remove any old fluent-bit list files to prevent conflicts.
+
+            # --- Proactive Cleanup ---
             echo "    - Removing any pre-existing Fluent Bit repository files..."
             rm -f /etc/apt/sources.list.d/fluent-bit.list /etc/apt/sources.list.d/fluentbit.list
-            # --- END OF THE FIX ---
-
+            
             # --- Common Repository Setup ---
             echo "    - Configuring Fluent Bit repository for ${REPO_PATH}..."
             mkdir -p /etc/apt/keyrings
@@ -135,7 +136,10 @@ YUM_REPO_EOF
             $PKG_MANAGER install -y python3 python3-pip curl net-tools fluent-bit > /dev/null
             ;;
     esac
-    pip3 install --break-system-packages psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 > /dev/null
+    
+    # --- THIS IS THE FIXED LINE ---
+    pip3 install --break-system-packages psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 pycryptodome==3.20.0 > /dev/null
+    
     echo "    - Dependencies installed."
 }
 
