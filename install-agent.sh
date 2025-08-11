@@ -69,7 +69,10 @@ function install_dependencies() {
     echo "--> [2/8] Installing dependencies for $OS_FAMILY..."
     case "$OS_FAMILY" in
         "debian")
-            apt-get update -y > /dev/null
+            # Allow the first update to fail in case of pre-existing broken repos (like the one we're about to fix).
+            echo "    - Updating package lists (ignoring potential errors from old repos)..."
+            apt-get update -y > /dev/null 2>&1 || true
+
             apt-get install -y curl gpg lsb-release > /dev/null
             
             # --- START: ROBUST REPOSITORY SETUP (UBUNTU 24.04+ COMPATIBLE) ---
@@ -85,12 +88,14 @@ function install_dependencies() {
                 ;;
             esac
             
-            # Use the new official method from the documentation
+            # Use the new official method from the documentation. This will overwrite any old/bad fluentbit.list file.
             mkdir -p /etc/apt/keyrings
             curl -s https://packages.fluentbit.io/fluentbit.key > /etc/apt/keyrings/fluentbit.asc
             echo "deb [signed-by=/etc/apt/keyrings/fluentbit.asc] https://packages.fluentbit.io/ubuntu/${REPO_CODENAME} ${REPO_CODENAME} main" > /etc/apt/sources.list.d/fluentbit.list
             # --- END: ROBUST REPOSITORY SETUP ---
 
+            # Now, update again with the corrected repository list. This one must succeed.
+            echo "    - Updating package lists again with the correct repository..."
             apt-get update -y > /dev/null
             apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit > /dev/null
             ;;
