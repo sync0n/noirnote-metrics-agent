@@ -2,7 +2,7 @@
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-echo "--- NoirNote Agent Installer (Multi-OS v11 with Cleanup Logic) ---"
+echo "--- NoirNote Agent Installer (Multi-OS v12 with Official Repo Setup) ---"
 
 # --- Global Variables ---
 AGENT_USER="noirnote-agent"
@@ -39,12 +39,9 @@ function check_root() {
 
 function cleanup_first() {
     echo "--> [Pre-flight] Performing cleanup for re-installation..."
-    # Stop the services if they are running to prevent file locks
     systemctl stop noirnote-agent.service >/dev/null 2>&1 || true
     systemctl stop fluent-bit.service >/dev/null 2>&1 || true
     echo "    - Stopped existing services (if any)."
-
-    # Remove the custom integrations config file to ensure it's cleanly regenerated
     rm -f "$NOIRNOTE_CUSTOM_FLUENTBIT_CONF"
     echo "    - Removed old custom log configuration to prevent duplicates."
 }
@@ -75,9 +72,11 @@ function install_dependencies() {
             apt-get update -y > /dev/null
             apt-get install -y curl gpg lsb-release > /dev/null
             
-            CODENAME=$(lsb_release -cs)
+            # --- START: ROBUST REPOSITORY SETUP (UBUNTU 24.04+ COMPATIBLE) ---
+            CODENAME=$(lsb_release -sc)
+            # Fallback for non-LTS or very new versions like 'oracular'
             case "$CODENAME" in
-              noble|jammy)
+              noble|jammy) # Supported LTS versions
                 REPO_CODENAME="$CODENAME"
                 ;;
               *)
@@ -86,8 +85,11 @@ function install_dependencies() {
                 ;;
             esac
             
-            curl -s https://packages.fluentbit.io/fluentbit.key | gpg --dearmor > /usr/share/keyrings/fluentbit-key.gpg
-            echo "deb [signed-by=/usr/share/keyrings/fluentbit-key.gpg] https://packages.fluentbit.io/ubuntu/${REPO_CODENAME} ${REPO_CODENAME} main" > /etc/apt/sources.list.d/fluent-bit.list
+            # Use the new official method from the documentation
+            mkdir -p /etc/apt/keyrings
+            curl -s https://packages.fluentbit.io/fluentbit.key > /etc/apt/keyrings/fluentbit.asc
+            echo "deb [signed-by=/etc/apt/keyrings/fluentbit.asc] https://packages.fluentbit.io/ubuntu/${REPO_CODENAME} ${REPO_CODENAME} main" > /etc/apt/sources.list.d/fluentbit.list
+            # --- END: ROBUST REPOSITORY SETUP ---
 
             apt-get update -y > /dev/null
             apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit > /dev/null
@@ -547,4 +549,23 @@ SERVICE_EOF
     echo ""
     echo "--- Installation Complete! ---"
     echo "The NoirNote agent and Fluent Bit are now running."
-    echo "To check agent status:      systemctl
+    echo "To check agent status:      systemctl status noirnote-agent.service"
+    echo "To check fluent-bit status: systemctl status fluent-bit.service"
+    echo "To view live agent logs:    journalctl -u noirnote-agent.service -f"
+}
+
+# --- Main Execution ---
+main() {
+    check_root
+    cleanup_first
+    detect_os
+    install_dependencies
+    setup_agent_user_and_dirs
+    configure_fluent_bit
+    configure_custom_integrations
+    create_agent_script
+    configure_agent "$@"
+    setup_service
+}
+
+main "$@"
