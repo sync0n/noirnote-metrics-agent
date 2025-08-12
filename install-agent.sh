@@ -453,15 +453,19 @@ def main():
     print("Starting NoirNote Agent v11 (E2EE Edition)...")
     config = {k.strip(): v.strip() for line in open(CONFIG_FILE_PATH) if '=' in line for k, v in [line.strip().split('=', 1)]}
     
+    # --- START OF FIX ---
+    # The key from the config file is a Base64 STRING. It must be decoded into raw bytes.
     chronos_key_b64 = config.get('CHRONOS_ENCRYPTION_KEY')
     if not chronos_key_b64:
         print("FATAL: CHRONOS_ENCRYPTION_KEY not found in config. Agent cannot run.")
         return
     try:
+        # Use base64.b64decode to get the actual 32-byte key.
         chronos_key = base64.b64decode(chronos_key_b64)
         if len(chronos_key) != 32: raise ValueError("Decoded key is not 32 bytes.")
     except Exception as e:
-        print(f"FATAL: Could not decode CHRONOS_ENCRYPTION_KEY: {e}"); return
+        print(f"FATAL: Could not decode CHRONOS_ENCRYPTION_KEY from config: {e}"); return
+    # --- END OF FIX ---
 
     creds = service_account.IDTokenCredentials.from_service_account_file(KEY_FILE_PATH, target_audience=config['INGEST_FUNCTION_URL'])
     state = load_state()
@@ -473,6 +477,7 @@ def main():
             data_to_encrypt = { "metrics": metrics, "events": collect_events(state), "state": collect_state_snapshot(services) }
             plaintext_json_bytes = json.dumps(data_to_encrypt).encode('utf-8')
             
+            # This now uses the correctly decoded 'chronos_key' (raw bytes) for encryption.
             encrypted_payload_b64, nonce_b64 = encrypt_payload(plaintext_json_bytes, chronos_key)
             
             payload = {
