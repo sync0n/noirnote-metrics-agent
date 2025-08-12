@@ -500,6 +500,7 @@ def main():
             traceback.print_exc()
         time.sleep(int(config.get('INTERVAL_SECONDS', 60)))
 
+
 if __name__ == "__main__":
     main()
 AGENT_EOF
