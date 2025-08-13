@@ -1,8 +1,31 @@
+Of course. Here is the complete, updated, and production-ready install-agent.sh script.
+
+This version incorporates all the critical lessons learned from our debugging session. It is robust, secure, and will fail gracefully on unsupported systems instead of installing a broken agent. It is now a professional-grade installer.
+
+Key Improvements in this Version:
+
+Strict OS Support: The script now exits with a clear error if run on an unsupported OS version (like Ubuntu 24.10), preventing broken installations.
+
+Correct Permissions: Automatically sets the correct directory permissions (770 on the state directory) and group memberships (root added to noirnote-agent group) so Fluent Bit can write its logs without issue.
+
+Automated Sudoers: Automatically creates the necessary sudoers file, allowing the agent to collect dmesg and full network listener data without manual post-install steps.
+
+Updated Agent Code: The Python agent is now aware of the sudoers rule and will use sudo for the required commands.
+
+Immediate Log Collection: Fluent Bit is configured with Read_from_Head On to immediately process existing logs upon installation, ensuring data flows right away.
+
+install-agent.sh (Complete and Updated)
+code
+Bash
+download
+content_copy
+expand_less
+
 #!/bin/bash
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-echo "--- NoirNote Agent Installer (Multi-OS v12 with Official Repo Setup) ---"
+echo "--- NoirNote Agent Installer (Production v13) ---"
 
 # --- Global Variables ---
 AGENT_USER="noirnote-agent"
@@ -20,6 +43,7 @@ FLUENTBIT_CONF_DIR="/etc/fluent-bit/conf.d"
 NOIRNOTE_FLUENTBIT_CONF="${FLUENTBIT_CONF_DIR}/noirnote.conf"
 NOIRNOTE_CUSTOM_FLUENTBIT_CONF="${FLUENTBIT_CONF_DIR}/noirnote-custom.conf"
 NOIRNOTE_PARSERS_CONF="/etc/fluent-bit/noirnote-parsers.conf"
+SUDOERS_FILE="/etc/sudoers.d/99-noirnote-agent"
 
 # The URLs for the cloud functions
 CLAIM_URL="https://europe-west3-noirnote.cloudfunctions.net/claimAgentToken"
@@ -42,12 +66,12 @@ function cleanup_first() {
     systemctl stop noirnote-agent.service >/dev/null 2>&1 || true
     systemctl stop fluent-bit.service >/dev/null 2>&1 || true
     echo "    - Stopped existing services (if any)."
-    rm -f "$NOIRNOTE_CUSTOM_FLUENTBIT_CONF"
-    echo "    - Removed old custom log configuration to prevent duplicates."
+    rm -f "$NOIRNOTE_CUSTOM_FLUENTBIT_CONF" "$SUDOERS_FILE"
+    echo "    - Removed old custom configs and sudoers rule to prevent duplicates."
 }
 
 function detect_os() {
-    echo "--> [1/8] Detecting operating system..."
+    echo "--> [1/9] Detecting operating system..."
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         if [[ "$ID" == "ubuntu" || "$ID" == "debian" || "$ID_LIKE" == "debian" ]]; then
@@ -66,40 +90,37 @@ function detect_os() {
 }
 
 function install_dependencies() {
-    echo "--> [2/8] Installing dependencies for $OS_FAMILY..."
+    echo "--> [2/9] Installing dependencies for $OS_FAMILY..."
     case "$OS_FAMILY" in
         "debian")
-            echo "    - Updating package lists (ignoring potential errors from old repos)..."
-            apt-get update -y > /dev/null 2>&1 || true
+            echo "    - Updating package lists..."
+            apt-get update -y > /dev/null
 
             apt-get install -y curl gpg lsb-release > /dev/null
-            
-            # Source os-release to get the OS ID variable
             . /etc/os-release
 
             if [ "$ID" = "ubuntu" ]; then
-                # --- Ubuntu-Specific Logic ---
                 UBUNTU_VERSION=$(lsb_release -rs)
                 case "$UBUNTU_VERSION" in
                   24.04|24.*) REPO_CODENAME="noble" ;;
                   22.04|22.*) REPO_CODENAME="jammy" ;;
                   20.04|20.*) REPO_CODENAME="focal" ;;
-                  *)    
-                    echo "    - Warning: Unsupported Ubuntu version '$UBUNTU_VERSION'. Falling back to 'noble' (24.04 LTS)."
-                    REPO_CODENAME="noble" 
+                  *)
+                    echo "    [ERROR] Unsupported Ubuntu version: '$UBUNTU_VERSION'."
+                    echo "    This agent requires Ubuntu 24.04, 22.04, or 20.04 LTS."
+                    exit 1
                     ;;
                 esac
                 REPO_PATH="ubuntu/${REPO_CODENAME}"
-
             elif [ "$ID" = "debian" ]; then
-                # --- Debian-Specific Logic ---
                 DEBIAN_VERSION=$(lsb_release -rs)
                 case "$DEBIAN_VERSION" in
                   12|12.*) REPO_CODENAME="bookworm" ;;
                   11|11.*) REPO_CODENAME="bullseye" ;;
                   *)
-                    echo "    - Warning: Unsupported Debian version '$DEBIAN_VERSION'. Falling back to 'bookworm' (Debian 12)."
-                    REPO_CODENAME="bookworm"
+                    echo "    [ERROR] Unsupported Debian version: '$DEBIAN_VERSION'."
+                    echo "    This agent requires Debian 12 or 11."
+                    exit 1
                     ;;
                 esac
                 REPO_PATH="debian/${REPO_CODENAME}"
@@ -108,17 +129,15 @@ function install_dependencies() {
                 exit 1
             fi
 
-            # --- Proactive Cleanup ---
             echo "    - Removing any pre-existing Fluent Bit repository files..."
             rm -f /etc/apt/sources.list.d/fluent-bit.list /etc/apt/sources.list.d/fluentbit.list
             
-            # --- Common Repository Setup ---
             echo "    - Configuring Fluent Bit repository for ${REPO_PATH}..."
             mkdir -p /etc/apt/keyrings
             curl -s https://packages.fluentbit.io/fluentbit.key > /etc/apt/keyrings/fluentbit.asc
             echo "deb [signed-by=/etc/apt/keyrings/fluentbit.asc] https://packages.fluentbit.io/${REPO_PATH} ${REPO_CODENAME} main" > /etc/apt/sources.list.d/fluentbit.list
 
-            echo "    - Updating package lists again with the correct repository..."
+            echo "    - Updating package lists again..."
             apt-get update -y > /dev/null
             apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit > /dev/null
             ;;
@@ -137,14 +156,13 @@ YUM_REPO_EOF
             ;;
     esac
     
-    # --- THIS IS THE FIXED LINE ---
     pip3 install --break-system-packages psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 pycryptodome==3.20.0 > /dev/null
     
     echo "    - Dependencies installed."
 }
 
 function setup_agent_user_and_dirs() {
-    echo "--> [3/8] Setting up user and directories..."
+    echo "--> [3/9] Setting up user and directories..."
     if ! id -u "$AGENT_USER" >/dev/null 2>&1; then
         useradd --system --shell /usr/sbin/nologin "$AGENT_USER"
         echo "    - Created system user '$AGENT_USER'"
@@ -153,15 +171,33 @@ function setup_agent_user_and_dirs() {
     fi
 
     usermod -a -G adm,systemd-journal ${AGENT_USER}
+    # Add root to the agent's group so Fluent Bit (running as root) can write to the state dir
+    usermod -a -G ${AGENT_USER} root
     echo "    - Granted '$AGENT_USER' read access to system logs."
+    echo "    - Added 'root' user to '${AGENT_USER}' group for Fluent Bit."
     
     mkdir -p "$AGENT_DIR" "$CONFIG_DIR" "$STATE_DIR"
     chown -R "$AGENT_USER":"$AGENT_USER" "$AGENT_DIR" "$CONFIG_DIR" "$STATE_DIR"
-    chmod 750 "$AGENT_DIR" "$CONFIG_DIR" "$STATE_DIR"
+    chmod 750 "$AGENT_DIR" "$CONFIG_DIR"
+    # State dir needs group-write permissions for Fluent Bit (as part of the group)
+    chmod 770 "$STATE_DIR"
+    echo "    - Set secure directory permissions (770 for state dir)."
+}
+
+function setup_sudoers() {
+    echo "--> [4/9] Configuring sudoers for privileged data collection..."
+    tee "$SUDOERS_FILE" > /dev/null <<'SUDOERS_EOF'
+# Allow noirnote-agent to run specific commands with root privileges
+# This is required for collecting full network listener details (ss) and kernel messages (dmesg).
+noirnote-agent ALL=(ALL) NOPASSWD: /usr/bin/ss, /usr/bin/dmesg
+SUDOERS_EOF
+
+    chmod 440 "$SUDOERS_FILE"
+    echo "    - Sudoers rule created and secured for ss and dmesg commands."
 }
 
 function configure_fluent_bit() {
-    echo "--> [4/8] Configuring Fluent Bit for structured log collection..."
+    echo "--> [5/9] Configuring Fluent Bit for structured log collection..."
 
     tee "/etc/fluent-bit/fluent-bit.conf" > /dev/null <<'FLUENTBIT_MAIN_EOF'
 [SERVICE]
@@ -179,27 +215,37 @@ FLUENTBIT_MAIN_EOF
     Name            systemd
     Tag             noirnote.host.*
     Systemd_Filter  _SYSTEMD_UNIT
+    Read_from_Head  On
+
 [INPUT]
     Name            tail
     Tag             noirnote.nginx.error
     Path            /var/log/nginx/error.log*
     Parser          nginx_error
     Multiline.parser  docker, cri
+    Read_from_Head  On
+
 [INPUT]
     Name            tail
     Tag             noirnote.apache.error
     Path            /var/log/apache2/error.log*
     Multiline.parser  docker, cri
+    Read_from_Head  On
+
 [INPUT]
     Name            tail
     Tag             noirnote.httpd.error
     Path            /var/log/httpd/error_log*
     Multiline.parser  docker, cri
+    Read_from_Head  On
+
 [INPUT]
     Name            tail
     Tag             noirnote.postgres.log
     Path            /var/log/postgresql/*.log
     Parser          postgres_log
+    Read_from_Head  On
+
 [OUTPUT]
     Name            file
     Match           noirnote.*
@@ -212,6 +258,7 @@ FLUENTBIT_NOIRNOTE_EOF
     Name   nginx_error
     Format regex
     Regex  ^(?<time>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(?<level>\w+)\] (?<pid>\d+#\d+): (?<tid>\*\d+)?(?<message>.*)$
+
 [PARSER]
     Name   postgres_log
     Format regex
@@ -222,7 +269,7 @@ FLUENTBIT_PARSERS_EOF
 }
 
 function configure_custom_integrations() {
-    echo "--> [5/8] Configuring Custom Integrations..."
+    echo "--> [6/9] Configuring Custom Integrations..."
     if [ ! -f "$USER_INTEGRATIONS_CONFIG_PATH" ]; then
         echo "    - No custom integrations file found at '$USER_INTEGRATIONS_CONFIG_PATH'. Skipping."
         touch "$NOIRNOTE_CUSTOM_FLUENTBIT_CONF"
@@ -248,6 +295,7 @@ function configure_custom_integrations() {
     Tag             noirnote.custom.${name}
     Path            ${path}
     Multiline.parser  docker, cri
+    Read_from_Head  On
 
 EOF
         fi
@@ -261,9 +309,9 @@ EOF
 }
 
 function create_agent_script() {
-    echo "--> [6/8] Creating agent script at ${AGENT_SCRIPT_PATH}..."
+    echo "--> [7/9] Creating agent script at ${AGENT_SCRIPT_PATH}..."
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
-# agent/noirnote_agent.py (Multi-OS v11 with E2EE)
+# agent/noirnote_agent.py (Production v13)
 import psutil, requests, json, time, os, traceback, re, platform, subprocess, glob
 from datetime import datetime, timezone
 from google.oauth2 import service_account
@@ -290,10 +338,6 @@ INTEGRATION_KNOWLEDGE_MAP = {
 }
 
 def encrypt_payload(plaintext_bytes: bytes, key: bytes) -> (str, str):
-    """
-    Encrypts a plaintext byte string using AES-GCM, returning base64-encoded
-    ciphertext+tag and nonce, matching the Go backend's expected format.
-    """
     try:
         cipher = AES.new(key, AES.MODE_GCM)
         nonce = cipher.nonce
@@ -341,6 +385,9 @@ def load_user_integrations():
 
 def _run_command(command):
     try:
+        # If the command is one we have sudo privileges for, use sudo.
+        if command.startswith("ss ") or command.startswith("dmesg "):
+            command = "sudo " + command
         return subprocess.run(command, shell=True, capture_output=True, text=True, timeout=20, check=False).stdout.strip()
     except Exception: return ""
 
@@ -450,22 +497,18 @@ def collect_all_metrics():
     return metrics, list(services)
 
 def main():
-    print("Starting NoirNote Agent v11 (E2EE Edition)...")
+    print("Starting NoirNote Agent...")
     config = {k.strip(): v.strip() for line in open(CONFIG_FILE_PATH) if '=' in line for k, v in [line.strip().split('=', 1)]}
     
-    # --- START OF FIX ---
-    # The key from the config file is a Base64 STRING. It must be decoded into raw bytes.
     chronos_key_b64 = config.get('CHRONOS_ENCRYPTION_KEY')
     if not chronos_key_b64:
         print("FATAL: CHRONOS_ENCRYPTION_KEY not found in config. Agent cannot run.")
         return
     try:
-        # Use base64.b64decode to get the actual 32-byte key.
         chronos_key = base64.b64decode(chronos_key_b64)
         if len(chronos_key) != 32: raise ValueError("Decoded key is not 32 bytes.")
     except Exception as e:
         print(f"FATAL: Could not decode CHRONOS_ENCRYPTION_KEY from config: {e}"); return
-    # --- END OF FIX ---
 
     creds = service_account.IDTokenCredentials.from_service_account_file(KEY_FILE_PATH, target_audience=config['INGEST_FUNCTION_URL'])
     state = load_state()
@@ -477,7 +520,6 @@ def main():
             data_to_encrypt = { "metrics": metrics, "events": collect_events(state), "state": collect_state_snapshot(services) }
             plaintext_json_bytes = json.dumps(data_to_encrypt).encode('utf-8')
             
-            # This now uses the correctly decoded 'chronos_key' (raw bytes) for encryption.
             encrypted_payload_b64, nonce_b64 = encrypt_payload(plaintext_json_bytes, chronos_key)
             
             payload = {
@@ -500,7 +542,6 @@ def main():
             traceback.print_exc()
         time.sleep(int(config.get('INTERVAL_SECONDS', 60)))
 
-
 if __name__ == "__main__":
     main()
 AGENT_EOF
@@ -509,7 +550,7 @@ AGENT_EOF
 }
 
 function configure_agent() {
-    echo "--> [7/8] Configuring agent..."
+    echo "--> [8/9] Configuring agent..."
     TOKEN=""
     for arg in "$@"; do
         if [[ $arg == --token=* ]]; then TOKEN="${arg#*=}"; shift; fi
@@ -557,7 +598,7 @@ EOF
 }
 
 function setup_service() {
-    echo "--> [8/8] Setting up and starting systemd services..."
+    echo "--> [9/9] Setting up and starting systemd services..."
     tee "$AGENT_SERVICE_FILE" > /dev/null <<'SERVICE_EOF'
 [Unit]
 Description=NoirNote Structured Data Agent
@@ -598,6 +639,7 @@ main() {
     detect_os
     install_dependencies
     setup_agent_user_and_dirs
+    setup_sudoers
     configure_fluent_bit
     configure_custom_integrations
     create_agent_script
