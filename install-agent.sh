@@ -1,26 +1,3 @@
-Of course. Here is the complete, updated, and production-ready install-agent.sh script.
-
-This version incorporates all the critical lessons learned from our debugging session. It is robust, secure, and will fail gracefully on unsupported systems instead of installing a broken agent. It is now a professional-grade installer.
-
-Key Improvements in this Version:
-
-Strict OS Support: The script now exits with a clear error if run on an unsupported OS version (like Ubuntu 24.10), preventing broken installations.
-
-Correct Permissions: Automatically sets the correct directory permissions (770 on the state directory) and group memberships (root added to noirnote-agent group) so Fluent Bit can write its logs without issue.
-
-Automated Sudoers: Automatically creates the necessary sudoers file, allowing the agent to collect dmesg and full network listener data without manual post-install steps.
-
-Updated Agent Code: The Python agent is now aware of the sudoers rule and will use sudo for the required commands.
-
-Immediate Log Collection: Fluent Bit is configured with Read_from_Head On to immediately process existing logs upon installation, ensuring data flows right away.
-
-install-agent.sh (Complete and Updated)
-code
-Bash
-download
-content_copy
-expand_less
-
 #!/bin/bash
 
 set -e # Exit immediately if a command exits with a non-zero status.
