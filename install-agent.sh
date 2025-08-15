@@ -2,7 +2,7 @@
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-echo "--- NoirNote Agent Installer (Production v14) ---"
+echo "--- NoirNote Agent Installer (Production v15 - FULL DATA) ---"
 
 # --- Global Variables ---
 AGENT_USER="noirnote-agent"
@@ -163,16 +163,15 @@ function setup_agent_user_and_dirs() {
 
 function setup_sudoers() {
     echo "--> [4/9] Configuring sudoers for privileged data collection..."
-    # Add iptables to the list of allowed commands
+    # --- NEW: Add more commands to the sudoers file for full data collection ---
     tee "$SUDOERS_FILE" > /dev/null <<'SUDOERS_EOF'
-# Allow noirnote-agent to run specific commands with root privileges
-# This is required for collecting full network listener details (ss), 
-# firewall rules (iptables), and kernel messages (dmesg).
-noirnote-agent ALL=(ALL) NOPASSWD: /usr/bin/ss, /usr/bin/dmesg, /usr/sbin/iptables
+# Allow noirnote-agent to run specific commands with root privileges for data collection.
+noirnote-agent ALL=(ALL) NOPASSWD: /usr/bin/ss, /usr/bin/dmesg, /usr/sbin/iptables, /usr/bin/systemctl, /usr/bin/journalctl, /usr/bin/last, /usr/bin/who
 SUDOERS_EOF
+    # --- END NEW ---
 
     chmod 440 "$SUDOERS_FILE"
-    echo "    - Sudoers rule created and secured for ss, dmesg, and iptables commands."
+    echo "    - Sudoers rule created and secured for data collection commands."
 }
 
 function configure_fluent_bit() {
@@ -290,7 +289,7 @@ EOF
 function create_agent_script() {
     echo "--> [7/9] Creating agent script at ${AGENT_SCRIPT_PATH}..."
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
-# agent/noirnote_agent.py (Production v14)
+# agent/noirnote_agent.py (Production v15 - FULL DATA)
 import psutil, requests, json, time, os, traceback, re, platform, subprocess, glob
 from datetime import datetime, timezone
 from google.oauth2 import service_account
@@ -365,8 +364,8 @@ def load_user_integrations():
 def _run_command(command):
     try:
         # If the command is one we have sudo privileges for, use sudo.
-        sudo_commands = ["ss", "dmesg", "iptables"]
-        if any(command.startswith(cmd) for cmd in sudo_commands):
+        sudo_commands = ["ss", "dmesg", "iptables", "systemctl", "journalctl", "last", "who"]
+        if any(cmd in command for cmd in sudo_commands):
             command = "sudo " + command
         return subprocess.run(command, shell=True, capture_output=True, text=True, timeout=20, check=False).stdout.strip()
     except Exception: return ""
@@ -378,7 +377,7 @@ def _read_pid_from_file(pid_path_pattern):
         with open(pid_files[0], 'r') as f: return int(f.read().strip())
     except (IOError, PermissionError, ValueError, IndexError): return None
 
-# --- NEW DATA COLLECTION FUNCTIONS ---
+# --- NEW: Add the missing data collection functions ---
 def get_firewall_rules():
     output = _run_command("iptables -S")
     return [line for line in output.splitlines() if line.strip() and not line.startswith('#')]
@@ -387,9 +386,13 @@ def get_systemd_services():
     output = _run_command("systemctl list-units --type=service --all --no-pager")
     services = []
     lines = output.splitlines()
+    if lines and 'UNIT' in lines[0]:
+        lines = lines[1:] # Skip header
     for line in lines:
         if '.service' in line:
-            parts = re.split(r'\s+', line.strip(), 4)
+            # Handle potential empty lines from systemctl output
+            line_cleaned = line.strip().replace('●', '').strip()
+            parts = re.split(r'\s+', line_cleaned, 4)
             if len(parts) >= 4:
                 services.append({"unit": parts[0], "load": parts[1], "active": parts[2], "sub": parts[3], "description": parts[4] if len(parts) > 4 else ""})
     return services
@@ -401,11 +404,15 @@ def get_system_logs():
 def get_active_connections():
     output = _run_command("ss -tuna")
     connections = []
+    # Skip the header line
     for line in output.splitlines()[1:]:
         try:
             parts = line.split()
-            connections.append({"protocol": parts[0], "state": parts[1], "local_address": parts[4], "peer_address": parts[5]})
-        except IndexError: continue
+            # Netid, State, Recv-Q, Send-Q, Local Address:Port, Peer Address:Port
+            if len(parts) >= 6:
+                 connections.append({"protocol": parts[0], "state": parts[1], "local_address": parts[4], "peer_address": parts[5]})
+        except IndexError:
+            continue
     return connections
 
 def get_recent_logins():
@@ -415,8 +422,9 @@ def get_active_sessions():
     return _run_command("who").splitlines()
 
 def get_failed_logins():
-    return _run_command("journalctl _COMM=sshd --no-pager -n 50 | grep 'Failed password'").splitlines()
-# --- END OF NEW FUNCTIONS ---
+    # A more robust grep that finds the common failure messages
+    return _run_command("journalctl _COMM=sshd --no-pager -n 50 | grep -E 'Failed|failure'").splitlines()
+# --- END NEW ---
 
 def get_structured_dmesg():
     output = _run_command("dmesg -T")
@@ -441,6 +449,7 @@ def get_version_info(command):
     return {"version": match.group(1) if match else None, "raw": raw}
 
 def collect_state_snapshot(discovered_services: list):
+    # --- NEW: Add calls to the new data collection functions ---
     snapshot = {
         'dmesg_events': get_structured_dmesg(),
         'network_listeners': get_ss_listeners(),
@@ -454,6 +463,7 @@ def collect_state_snapshot(discovered_services: list):
         'versions': {},
         'configs': {}
     }
+    # --- END NEW ---
     for service in discovered_services:
         k = INTEGRATION_KNOWLEDGE_MAP.get(service, {})
         if k.get("version_command"): snapshot['versions'][service] = get_version_info(k["version_command"])
@@ -517,8 +527,14 @@ def collect_all_metrics():
             if conn.status in tcp_states: tcp_states[conn.status] += 1
     except psutil.AccessDenied: pass
 
+    # --- NEW: Calculate and add top-level cpu_percent ---
+    cpu_times = psutil.cpu_times_percent()
+    cpu_percent_val = 100.0 - cpu_times.idle
+    # --- END NEW ---
+
     metrics = {
-        "cpu_states": psutil.cpu_times_percent()._asdict(),
+        "cpu_percent": cpu_percent_val, # --- NEW ---
+        "cpu_states": cpu_times._asdict(),
         "memory_details": psutil.virtual_memory()._asdict(),
         "disk_io": {"reads_per_sec": (disk.read_count - last_disk_io.read_count) / elapsed, "writes_per_sec": (disk.write_count - last_disk_io.write_count) / elapsed},
         "disks": [{"device": p.device, "mountpoint": p.mountpoint, "percent": psutil.disk_usage(p.mountpoint).percent} for p in psutil.disk_partitions(all=False) if 'loop' not in p.device],
