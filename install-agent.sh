@@ -2,7 +2,7 @@
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-echo "--- NoirNote Agent Installer (Production v15 - FULL DATA) ---"
+echo "--- NoirNote Agent Installer (Production v16 - FULL DATA) ---"
 
 # --- Global Variables ---
 AGENT_USER="noirnote-agent"
@@ -53,13 +53,17 @@ function detect_os() {
         . /etc/os-release
         if [[ "$ID" == "ubuntu" || "$ID" == "debian" || "$ID_LIKE" == "debian" ]]; then
             OS_FAMILY="debian"
-        elif [[ "$ID" == "centos" || "$ID" == "rhel" || "$ID" == "fedora" || "$ID_LIKE" == "rhel fedora" ]]; then
+        elif [[ "$ID" == "centos" || "$ID" == "rhel" || "$ID" == "fedora" || "$ID_LIKE" == "rhel fedora" || "$ID_LIKE" == *"rhel"* || "$ID_LIKE" == *"fedora"* ]]; then
             OS_FAMILY="rhel"
+        elif [[ "$ID" == "amzn" ]]; then
+            OS_FAMILY="rhel" # Treat Amazon Linux like RHEL
+            echo "    - Detected Amazon Linux, treating as RHEL-compatible"
         else
             echo "Error: Unsupported Linux distribution: $ID"
+            echo "Supported distributions: Ubuntu LTS (18.04+), Debian (11+), RHEL/CentOS (7+), Amazon Linux"
             exit 1
         fi
-        echo "    - Detected OS Family: $OS_FAMILY"
+        echo "    - Detected OS Family: $OS_FAMILY ($ID $VERSION_ID)"
     else
         echo "Error: Cannot detect operating system. /etc/os-release not found."
         exit 1
@@ -73,7 +77,13 @@ function install_dependencies() {
             echo "    - Updating package lists..."
             apt-get update -y > /dev/null
 
-            apt-get install -y curl gpg lsb-release > /dev/null
+            # Install basic tools first
+            echo "    - Installing basic tools..."
+            if ! apt-get install -y curl gpg lsb-release > /dev/null; then
+                echo "Error: Failed to install basic dependencies"
+                exit 1
+            fi
+
             . /etc/os-release
 
             if [ "$ID" = "ubuntu" ]; then
@@ -82,22 +92,25 @@ function install_dependencies() {
                   24.04|24.*) REPO_CODENAME="noble" ;;
                   22.04|22.*) REPO_CODENAME="jammy" ;;
                   20.04|20.*) REPO_CODENAME="focal" ;;
+                  18.04|18.*) REPO_CODENAME="bionic" ;;
                   *)
-                    echo "    [ERROR] Unsupported Ubuntu version: '$UBUNTU_VERSION'."
-                    echo "    This agent requires Ubuntu 24.04, 22.04, or 20.04 LTS."
-                    exit 1
+                    echo "    [WARNING] Untested Ubuntu version: '$UBUNTU_VERSION'."
+                    echo "    This agent has been tested on Ubuntu 24.04, 22.04, 20.04, and 18.04 LTS."
+                    echo "    Attempting to use focal (20.04) repository as fallback..."
+                    REPO_CODENAME="focal"
                     ;;
                 esac
                 REPO_PATH="ubuntu/${REPO_CODENAME}"
             elif [ "$ID" = "debian" ]; then
-                DEBIAN_VERSION=$(lsb_release -rs)
+                DEBIAN_VERSION=$(lsb_release -rs | cut -d'.' -f1)
                 case "$DEBIAN_VERSION" in
-                  12|12.*) REPO_CODENAME="bookworm" ;;
-                  11|11.*) REPO_CODENAME="bullseye" ;;
+                  12) REPO_CODENAME="bookworm" ;;
+                  11) REPO_CODENAME="bullseye" ;;
                   *)
-                    echo "    [ERROR] Unsupported Debian version: '$DEBIAN_VERSION'."
-                    echo "    This agent requires Debian 12 or 11."
-                    exit 1
+                    echo "    [WARNING] Untested Debian version: '$DEBIAN_VERSION'."
+                    echo "    This agent has been tested on Debian 12 and 11."
+                    echo "    Attempting to use bullseye (11) repository as fallback..."
+                    REPO_CODENAME="bullseye"
                     ;;
                 esac
                 REPO_PATH="debian/${REPO_CODENAME}"
@@ -111,31 +124,61 @@ function install_dependencies() {
             
             echo "    - Configuring Fluent Bit repository for ${REPO_PATH}..."
             mkdir -p /etc/apt/keyrings
-            curl -s https://packages.fluentbit.io/fluentbit.key > /etc/apt/keyrings/fluentbit.asc
+            if ! curl -s https://packages.fluentbit.io/fluentbit.key > /etc/apt/keyrings/fluentbit.asc; then
+                echo "Error: Failed to download Fluent Bit GPG key"
+                exit 1
+            fi
             echo "deb [signed-by=/etc/apt/keyrings/fluentbit.asc] https://packages.fluentbit.io/${REPO_PATH} ${REPO_CODENAME} main" > /etc/apt/sources.list.d/fluentbit.list
 
             echo "    - Updating package lists again..."
             apt-get update -y > /dev/null
-            apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit > /dev/null
+            
+            echo "    - Installing system packages..."
+            if ! apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit > /dev/null; then
+                echo "Error: Failed to install system packages"
+                exit 1
+            fi
             ;;
         "rhel")
             PKG_MANAGER=$(command -v dnf || command -v yum)
+            echo "    - Using package manager: $PKG_MANAGER"
+            
+            echo "    - Updating package cache..."
             $PKG_MANAGER makecache > /dev/null
+            
+            echo "    - Configuring Fluent Bit repository..."
+            # Use $releasever for dynamic version detection
             tee /etc/yum.repos.d/fluent-bit.repo > /dev/null <<'YUM_REPO_EOF'
 [fluent-bit]
 name = Fluent Bit
-baseurl = https://packages.fluentbit.io/centos/8/$basearch/
+baseurl = https://packages.fluentbit.io/centos/$releasever/$basearch/
 gpgcheck=1
 gpgkey=https://packages.fluentbit.io/fluentbit.key
 enabled=1
 YUM_REPO_EOF
-            $PKG_MANAGER install -y python3 python3-pip curl net-tools fluent-bit > /dev/null
+            
+            echo "    - Installing system packages..."
+            if ! $PKG_MANAGER install -y python3 python3-pip curl net-tools fluent-bit > /dev/null; then
+                echo "Error: Failed to install system packages"
+                exit 1
+            fi
             ;;
     esac
     
-    pip3 install --break-system-packages psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 pycryptodome==3.20.0 > /dev/null
+    echo "    - Creating Python virtual environment..."
+    python3 -m venv "${AGENT_DIR}/venv"
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to create Python virtual environment"
+        exit 1
+    fi
     
-    echo "    - Dependencies installed."
+    echo "    - Installing Python packages into virtual environment..."
+    if ! "${AGENT_DIR}/venv/bin/pip" install psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 pycryptodome==3.20.0 > /dev/null; then
+        echo "Error: Failed to install Python dependencies"
+        exit 1
+    fi
+    
+    echo "    - Dependencies installed successfully."
 }
 
 function setup_agent_user_and_dirs() {
@@ -163,12 +206,30 @@ function setup_agent_user_and_dirs() {
 
 function setup_sudoers() {
     echo "--> [4/9] Configuring sudoers for privileged data collection..."
-    # --- NEW: Add more commands to the sudoers file for full data collection ---
-    tee "$SUDOERS_FILE" > /dev/null <<'SUDOERS_EOF'
+    
+    # Find absolute paths for commands to handle different distributions
+    SS_PATH=$(command -v ss)
+    DMESG_PATH=$(command -v dmesg)
+    IPTABLES_PATH=$(command -v iptables)
+    SYSTEMCTL_PATH=$(command -v systemctl)
+    JOURNALCTL_PATH=$(command -v journalctl)
+    LAST_PATH=$(command -v last)
+    WHO_PATH=$(command -v who)
+    
+    if [ -z "$SS_PATH" ] || [ -z "$DMESG_PATH" ] || [ -z "$IPTABLES_PATH" ] || [ -z "$SYSTEMCTL_PATH" ] || [ -z "$JOURNALCTL_PATH" ] || [ -z "$LAST_PATH" ] || [ -z "$WHO_PATH" ]; then
+        echo "Error: Could not find all required system commands"
+        exit 1
+    fi
+    
+    echo "    - Command paths detected:"
+    echo "      ss: $SS_PATH"
+    echo "      systemctl: $SYSTEMCTL_PATH"
+    echo "      iptables: $IPTABLES_PATH"
+    
+    tee "$SUDOERS_FILE" > /dev/null <<SUDOERS_EOF
 # Allow noirnote-agent to run specific commands with root privileges for data collection.
-noirnote-agent ALL=(ALL) NOPASSWD: /usr/bin/ss, /usr/bin/dmesg, /usr/sbin/iptables, /usr/bin/systemctl, /usr/bin/journalctl, /usr/bin/last, /usr/bin/who
+noirnote-agent ALL=(ALL) NOPASSWD: ${SS_PATH}, ${DMESG_PATH}, ${IPTABLES_PATH}, ${SYSTEMCTL_PATH}, ${JOURNALCTL_PATH}, ${LAST_PATH}, ${WHO_PATH}
 SUDOERS_EOF
-    # --- END NEW ---
 
     chmod 440 "$SUDOERS_FILE"
     echo "    - Sudoers rule created and secured for data collection commands."
@@ -221,7 +282,7 @@ FLUENTBIT_MAIN_EOF
     Name            tail
     Tag             noirnote.postgres.log
     Path            /var/log/postgresql/*.log
-    Parser          postgres_log
+    Multiline.parser  docker, cri
     Read_from_Head  On
 
 [OUTPUT]
@@ -256,6 +317,9 @@ function configure_custom_integrations() {
     
     echo "    - Found custom integrations file. Generating Fluent Bit config..."
     
+    # Clear the custom config file
+    > "$NOIRNOTE_CUSTOM_FLUENTBIT_CONF"
+    
     awk '
         BEGIN { printing = 0 }
         /^\[logs\]$/ { printing = 1; next }
@@ -289,7 +353,7 @@ EOF
 function create_agent_script() {
     echo "--> [7/9] Creating agent script at ${AGENT_SCRIPT_PATH}..."
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
-# agent/noirnote_agent.py (Production v15 - FULL DATA)
+# agent/noirnote_agent.py (Production v16 - FULL DATA)
 import psutil, requests, json, time, os, traceback, re, platform, subprocess, glob
 from datetime import datetime, timezone
 from google.oauth2 import service_account
@@ -306,14 +370,42 @@ USER_INTEGRATIONS_CONFIG_PATH = "/etc/noirnote/integrations.conf"
 
 last_net_io, last_disk_io, last_time = psutil.net_io_counters(), psutil.disk_io_counters(), time.time()
 
+# OS-aware file paths for better cross-distribution compatibility
+def get_os_family():
+    try:
+        with open('/etc/os-release') as f:
+            for line in f:
+                if line.startswith('ID_LIKE='):
+                    if 'debian' in line: return 'debian'
+                    if 'rhel' in line or 'fedora' in line: return 'rhel'
+                if line.startswith('ID='):
+                    if 'debian' in line or 'ubuntu' in line: return 'debian'
+                    if 'centos' in line or 'rhel' in line or 'fedora' in line or 'amzn' in line: return 'rhel'
+    except FileNotFoundError:
+        return 'unknown'
+    return 'unknown'
+
+OS_FAMILY = get_os_family()
+
+# Base integration knowledge map
 INTEGRATION_KNOWLEDGE_MAP = {
     "nginx": {"config_paths": ["/etc/nginx/nginx.conf"], "version_command": "nginx -v", "pid_path": "/var/run/nginx.pid"},
-    "postgres": {"config_paths": ["/etc/postgresql/*/main/postgresql.conf"], "version_command": "psql --version", "pid_path": "/var/run/postgresql/*.pid"},
-    "httpd": {"config_paths": ["/etc/httpd/conf/httpd.conf"], "version_command": "httpd -v", "pid_path": "/var/run/httpd/httpd.pid"},
-    "apache2": {"config_paths": ["/etc/apache2/apache2.conf"], "version_command": "apache2 -v", "pid_path": "/var/run/apache2/apache2.pid"},
     "mysqld": {"config_paths": ["/etc/mysql/my.cnf", "/etc/my.cnf"], "version_command": "mysql --version", "pid_path": "/var/run/mysqld/mysqld.pid"},
     "redis-server": {"config_paths": ["/etc/redis/redis.conf"], "version_command": "redis-server --version", "pid_path": "/var/run/redis/redis-server.pid"}
 }
+
+# OS-specific service configurations
+if OS_FAMILY == 'debian':
+    INTEGRATION_KNOWLEDGE_MAP.update({
+        "postgres": {"config_paths": ["/etc/postgresql/*/main/postgresql.conf"], "version_command": "psql --version", "pid_path": "/var/run/postgresql/*.pid"},
+        "apache2": {"config_paths": ["/etc/apache2/apache2.conf"], "version_command": "apache2 -v", "pid_path": "/var/run/apache2/apache2.pid"},
+    })
+elif OS_FAMILY == 'rhel':
+    INTEGRATION_KNOWLEDGE_MAP.update({
+        # Note the different paths and service names for RHEL
+        "postgres": {"config_paths": ["/var/lib/pgsql/data/postgresql.conf", "/var/lib/pgsql/*/data/postgresql.conf"], "version_command": "psql --version", "pid_path": "/var/run/postgresql/*.pid"},
+        "httpd": {"config_paths": ["/etc/httpd/conf/httpd.conf"], "version_command": "httpd -v", "pid_path": "/var/run/httpd/httpd.pid"},
+    })
 
 def encrypt_payload(plaintext_bytes: bytes, key: bytes) -> (str, str):
     try:
@@ -377,7 +469,6 @@ def _read_pid_from_file(pid_path_pattern):
         with open(pid_files[0], 'r') as f: return int(f.read().strip())
     except (IOError, PermissionError, ValueError, IndexError): return None
 
-# --- NEW: Add the missing data collection functions ---
 def get_firewall_rules():
     output = _run_command("iptables -S")
     return [line for line in output.splitlines() if line.strip() and not line.startswith('#')]
@@ -424,7 +515,6 @@ def get_active_sessions():
 def get_failed_logins():
     # A more robust grep that finds the common failure messages
     return _run_command("journalctl _COMM=sshd --no-pager -n 50 | grep -E 'Failed|failure'").splitlines()
-# --- END NEW ---
 
 def get_structured_dmesg():
     output = _run_command("dmesg -T")
@@ -449,7 +539,6 @@ def get_version_info(command):
     return {"version": match.group(1) if match else None, "raw": raw}
 
 def collect_state_snapshot(discovered_services: list):
-    # --- NEW: Add calls to the new data collection functions ---
     snapshot = {
         'dmesg_events': get_structured_dmesg(),
         'network_listeners': get_ss_listeners(),
@@ -463,7 +552,7 @@ def collect_state_snapshot(discovered_services: list):
         'versions': {},
         'configs': {}
     }
-    # --- END NEW ---
+    
     for service in discovered_services:
         k = INTEGRATION_KNOWLEDGE_MAP.get(service, {})
         if k.get("version_command"): snapshot['versions'][service] = get_version_info(k["version_command"])
@@ -527,13 +616,12 @@ def collect_all_metrics():
             if conn.status in tcp_states: tcp_states[conn.status] += 1
     except psutil.AccessDenied: pass
 
-    # --- NEW: Calculate and add top-level cpu_percent ---
+    # Calculate and add top-level cpu_percent
     cpu_times = psutil.cpu_times_percent()
     cpu_percent_val = 100.0 - cpu_times.idle
-    # --- END NEW ---
 
     metrics = {
-        "cpu_percent": cpu_percent_val, # --- NEW ---
+        "cpu_percent": cpu_percent_val,
         "cpu_states": cpu_times._asdict(),
         "memory_details": psutil.virtual_memory()._asdict(),
         "disk_io": {"reads_per_sec": (disk.read_count - last_disk_io.read_count) / elapsed, "writes_per_sec": (disk.write_count - last_disk_io.write_count) / elapsed},
@@ -545,8 +633,15 @@ def collect_all_metrics():
     return metrics, list(services)
 
 def main():
-    print("Starting NoirNote Agent...")
-    config = {k.strip(): v.strip() for line in open(CONFIG_FILE_PATH) if '=' in line for k, v in [line.strip().split('=', 1)]}
+    print(f"Starting NoirNote Agent (OS Family: {OS_FAMILY})...")
+    try:
+        config = {k.strip(): v.strip() for line in open(CONFIG_FILE_PATH) if '=' in line for k, v in [line.strip().split('=', 1)]}
+    except FileNotFoundError:
+        print(f"FATAL: Configuration file not found at {CONFIG_FILE_PATH}")
+        return
+    except Exception as e:
+        print(f"FATAL: Error reading configuration: {e}")
+        return
     
     chronos_key_b64 = config.get('CHRONOS_ENCRYPTION_KEY')
     if not chronos_key_b64:
@@ -556,16 +651,32 @@ def main():
         chronos_key = base64.b64decode(chronos_key_b64)
         if len(chronos_key) != 32: raise ValueError("Decoded key is not 32 bytes.")
     except Exception as e:
-        print(f"FATAL: Could not decode CHRONOS_ENCRYPTION_KEY from config: {e}"); return
+        print(f"FATAL: Could not decode CHRONOS_ENCRYPTION_KEY from config: {e}")
+        return
 
-    creds = service_account.IDTokenCredentials.from_service_account_file(KEY_FILE_PATH, target_audience=config['INGEST_FUNCTION_URL'])
+    try:
+        creds = service_account.IDTokenCredentials.from_service_account_file(KEY_FILE_PATH, target_audience=config['INGEST_FUNCTION_URL'])
+    except FileNotFoundError:
+        print(f"FATAL: Service account key file not found at {KEY_FILE_PATH}")
+        return
+    except Exception as e:
+        print(f"FATAL: Error loading service account credentials: {e}")
+        return
+
     state = load_state()
     session = google.auth.transport.requests.Request()
+    
+    print("Agent initialized successfully. Starting data collection loop...")
+    
     while True:
         try:
             metrics, services = collect_all_metrics()
             
-            data_to_encrypt = { "metrics": metrics, "events": collect_events(state), "state": collect_state_snapshot(services) }
+            data_to_encrypt = { 
+                "metrics": metrics, 
+                "events": collect_events(state), 
+                "state": collect_state_snapshot(services) 
+            }
             plaintext_json_bytes = json.dumps(data_to_encrypt).encode('utf-8')
             
             encrypted_payload_b64, nonce_b64 = encrypt_payload(plaintext_json_bytes, chronos_key)
@@ -585,16 +696,24 @@ def main():
             resp.raise_for_status()
             print(f"Successfully pushed ENCRYPTED payload. Status: {resp.status_code}")
             save_state(state)
+        except requests.exceptions.RequestException as e:
+            print(f"ERROR: Network error during data transmission: {e}")
         except Exception as e:
             print(f"ERROR: An unhandled exception occurred in the main loop: {e}")
             traceback.print_exc()
-        time.sleep(int(config.get('INTERVAL_SECONDS', 60)))
+        
+        try:
+            time.sleep(int(config.get('INTERVAL_SECONDS', 60)))
+        except KeyboardInterrupt:
+            print("Agent shutting down...")
+            break
 
 if __name__ == "__main__":
     main()
 AGENT_EOF
     chown "$AGENT_USER":"$AGENT_USER" "$AGENT_SCRIPT_PATH"
     chmod 750 "$AGENT_SCRIPT_PATH"
+    echo "    - Agent script created and secured."
 }
 
 function configure_agent() {
@@ -609,29 +728,42 @@ function configure_agent() {
         return
     fi
     if [ -z "$TOKEN" ]; then
-        echo "    [ERROR] --token flag is required for initial configuration."; exit 1
+        echo "    [ERROR] --token flag is required for initial configuration."
+        echo "    Usage: $0 --token=YOUR_AGENT_TOKEN"
+        exit 1
     fi
 
     echo "    - Claiming credentials..."
     RESPONSE_JSON=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"token\": \"$TOKEN\"}" "$CLAIM_URL")
+    
+    if [ $? -ne 0 ]; then
+        echo "    [ERROR] Failed to contact claim service. Check your internet connection."
+        exit 1
+    fi
 
     if ! echo "$RESPONSE_JSON" | grep -q "private_key"; then
-        echo "    [ERROR] Failed to claim agent credentials. Response: $RESPONSE_JSON"; exit 1
+        echo "    [ERROR] Failed to claim agent credentials. Response: $RESPONSE_JSON"
+        exit 1
     fi
 
-    SERVICE_ACCOUNT_KEY_JSON=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.dumps(json.load(sys.stdin).get('serviceAccountKey'), indent=2))")
-    USER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('userId', ''))")
-    SERVER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('serverId', ''))")
-    CHRONOS_KEY=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('chronosKey', ''))")
+    echo "    - Processing claim response..."
+    SERVICE_ACCOUNT_KEY_JSON=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.dumps(json.load(sys.stdin).get('serviceAccountKey'), indent=2))" 2>/dev/null)
+    USER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('userId', ''))" 2>/dev/null)
+    SERVER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('serverId', ''))" 2>/dev/null)
+    CHRONOS_KEY=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('chronosKey', ''))" 2>/dev/null)
     
     if [ -z "$SERVICE_ACCOUNT_KEY_JSON" ] || [ -z "$USER_ID" ] || [ -z "$SERVER_ID" ] || [ -z "$CHRONOS_KEY" ]; then
-        echo "    [ERROR] Claim response was incomplete."; exit 1
+        echo "    [ERROR] Claim response was incomplete or malformed."
+        echo "    Please check your token and try again."
+        exit 1
     fi
     
+    echo "    - Saving service account key..."
     echo "$SERVICE_ACCOUNT_KEY_JSON" > "$KEY_FILE_PATH"
     chown "$AGENT_USER":"$AGENT_USER" "$KEY_FILE_PATH"
     chmod 400 "$KEY_FILE_PATH"
 
+    echo "    - Creating agent configuration..."
     tee "$CONFIG_FILE_PATH" > /dev/null <<EOF
 SERVER_ID=$SERVER_ID
 USER_ID=$USER_ID
@@ -647,7 +779,9 @@ EOF
 
 function setup_service() {
     echo "--> [9/9] Setting up and starting systemd services..."
-    tee "$AGENT_SERVICE_FILE" > /dev/null <<'SERVICE_EOF'
+    
+    # Use the virtual environment Python executable
+    tee "$AGENT_SERVICE_FILE" > /dev/null <<SERVICE_EOF
 [Unit]
 Description=NoirNote Structured Data Agent
 After=network-online.target fluent-bit.service
@@ -658,26 +792,57 @@ Type=simple
 User=noirnote-agent
 Group=noirnote-agent
 SupplementaryGroups=adm systemd-journal
-ExecStart=/usr/bin/python3 -u /opt/noirnote-agent/noirnote_agent.py
+ExecStart=${AGENT_DIR}/venv/bin/python3 -u ${AGENT_SCRIPT_PATH}
 Restart=on-failure
 RestartSec=10
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 SERVICE_EOF
     
+    echo "    - Reloading systemd configuration..."
     systemctl daemon-reload
-    systemctl enable fluent-bit.service || echo "Warning: Could not enable fluent-bit service."
-    systemctl restart fluent-bit.service || echo "Warning: Could not restart fluent-bit service."
+    
+    echo "    - Configuring Fluent Bit service..."
+    systemctl enable fluent-bit.service || echo "    [WARNING] Could not enable fluent-bit service."
+    if systemctl restart fluent-bit.service; then
+        echo "    - Fluent Bit service started successfully."
+    else
+        echo "    [WARNING] Could not restart fluent-bit service. Check logs with: journalctl -u fluent-bit.service"
+    fi
+    
+    echo "    - Configuring NoirNote Agent service..."
     systemctl enable noirnote-agent.service
-    systemctl restart noirnote-agent.service
+    if systemctl restart noirnote-agent.service; then
+        echo "    - NoirNote Agent service started successfully."
+    else
+        echo "    [ERROR] Failed to start NoirNote Agent service. Check logs with: journalctl -u noirnote-agent.service"
+        exit 1
+    fi
+    
+    # Wait a moment for services to start
+    sleep 3
     
     echo ""
     echo "--- Installation Complete! ---"
-    echo "The NoirNote agent and Fluent Bit are now running."
-    echo "To check agent status:      systemctl status noirnote-agent.service"
-    echo "To check fluent-bit status: systemctl status fluent-bit.service"
-    echo "To view live agent logs:    journalctl -u noirnote-agent.service -f"
+    echo ""
+    echo "Service Status:"
+    systemctl is-active --quiet fluent-bit.service && echo "  ✓ Fluent Bit: Running" || echo "  ✗ Fluent Bit: Not running"
+    systemctl is-active --quiet noirnote-agent.service && echo "  ✓ NoirNote Agent: Running" || echo "  ✗ NoirNote Agent: Not running"
+    echo ""
+    echo "Useful Commands:"
+    echo "  Check agent status:      systemctl status noirnote-agent.service"
+    echo "  Check fluent-bit status: systemctl status fluent-bit.service"
+    echo "  View live agent logs:    journalctl -u noirnote-agent.service -f"
+    echo "  View fluent-bit logs:    journalctl -u fluent-bit.service -f"
+    echo ""
+    echo "Configuration Files:"
+    echo "  Agent config:     $CONFIG_FILE_PATH"
+    echo "  Service account:  $KEY_FILE_PATH"
+    echo "  Custom logs:      $USER_INTEGRATIONS_CONFIG_PATH (optional)"
+    echo ""
 }
 
 # --- Main Execution ---
