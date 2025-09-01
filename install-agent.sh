@@ -2,7 +2,7 @@
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-echo "--- NoirNote Agent Installer (Production v16 - FULL DATA) ---"
+echo "--- NoirNote Agent Installer (Production v16.1 - FULL DATA) ---"
 
 # --- Global Variables ---
 AGENT_USER="noirnote-agent"
@@ -89,15 +89,15 @@ function install_dependencies() {
             if [ "$ID" = "ubuntu" ]; then
                 UBUNTU_VERSION=$(lsb_release -rs)
                 case "$UBUNTU_VERSION" in
-                  24.04|24.*) REPO_CODENAME="noble" ;;
+                  24.10|24.*) REPO_CODENAME="noble" ;; # Use 24.04 repo for 24.10
                   22.04|22.*) REPO_CODENAME="jammy" ;;
                   20.04|20.*) REPO_CODENAME="focal" ;;
                   18.04|18.*) REPO_CODENAME="bionic" ;;
                   *)
                     echo "    [WARNING] Untested Ubuntu version: '$UBUNTU_VERSION'."
                     echo "    This agent has been tested on Ubuntu 24.04, 22.04, 20.04, and 18.04 LTS."
-                    echo "    Attempting to use focal (20.04) repository as fallback..."
-                    REPO_CODENAME="focal"
+                    echo "    Attempting to use noble (24.04) repository as fallback..."
+                    REPO_CODENAME="noble"
                     ;;
                 esac
                 REPO_PATH="ubuntu/${REPO_CODENAME}"
@@ -134,7 +134,8 @@ function install_dependencies() {
             apt-get update -y > /dev/null
             
             echo "    - Installing system packages..."
-            if ! apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit > /dev/null; then
+            # MODIFICATION: Added 'iptables' to the package list to ensure it's available.
+            if ! apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit iptables > /dev/null; then
                 echo "Error: Failed to install system packages"
                 exit 1
             fi
@@ -158,7 +159,8 @@ enabled=1
 YUM_REPO_EOF
             
             echo "    - Installing system packages..."
-            if ! $PKG_MANAGER install -y python3 python3-pip curl net-tools fluent-bit > /dev/null; then
+            # MODIFICATION: Added 'iptables' to the package list to ensure it's available.
+            if ! $PKG_MANAGER install -y python3 python3-pip curl net-tools fluent-bit iptables > /dev/null; then
                 echo "Error: Failed to install system packages"
                 exit 1
             fi
@@ -217,7 +219,7 @@ function setup_sudoers() {
     WHO_PATH=$(command -v who)
     
     if [ -z "$SS_PATH" ] || [ -z "$DMESG_PATH" ] || [ -z "$IPTABLES_PATH" ] || [ -z "$SYSTEMCTL_PATH" ] || [ -z "$JOURNALCTL_PATH" ] || [ -z "$LAST_PATH" ] || [ -z "$WHO_PATH" ]; then
-        echo "Error: Could not find all required system commands"
+        echo "Error: Could not find all required system commands. One or more of ss, dmesg, iptables, systemctl, journalctl, last, who are missing."
         exit 1
     fi
     
@@ -353,7 +355,7 @@ EOF
 function create_agent_script() {
     echo "--> [7/9] Creating agent script at ${AGENT_SCRIPT_PATH}..."
     tee "$AGENT_SCRIPT_PATH" > /dev/null <<'AGENT_EOF'
-# agent/noirnote_agent.py (Production v16 - FULL DATA)
+# agent/noirnote_agent.py (Production v16.1 - FULL DATA)
 import psutil, requests, json, time, os, traceback, re, platform, subprocess, glob
 from datetime import datetime, timezone
 from google.oauth2 import service_account
