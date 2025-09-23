@@ -134,7 +134,6 @@ function install_dependencies() {
             apt-get update -y > /dev/null
             
             echo "    - Installing system packages..."
-            # MODIFICATION: Added 'iptables' to the package list to ensure it's available.
             if ! apt-get install -y python3 python3-pip python3-venv net-tools fluent-bit iptables > /dev/null; then
                 echo "Error: Failed to install system packages"
                 exit 1
@@ -159,7 +158,6 @@ enabled=1
 YUM_REPO_EOF
             
             echo "    - Installing system packages..."
-            # MODIFICATION: Added 'iptables' to the package list to ensure it's available.
             if ! $PKG_MANAGER install -y python3 python3-pip curl net-tools fluent-bit iptables > /dev/null; then
                 echo "Error: Failed to install system packages"
                 exit 1
@@ -217,9 +215,8 @@ function setup_sudoers() {
     JOURNALCTL_PATH=$(command -v journalctl)
     LAST_PATH=$(command -v last)
     WHO_PATH=$(command -v who)
-    PS_PATH=$(command -v ps) # NEW: Find the path for 'ps'
+    PS_PATH=$(command -v ps)
 
-    # NEW: Added PS_PATH to the check
     if [ -z "$SS_PATH" ] || [ -z "$DMESG_PATH" ] || [ -z "$IPTABLES_PATH" ] || [ -z "$SYSTEMCTL_PATH" ] || [ -z "$JOURNALCTL_PATH" ] || [ -z "$LAST_PATH" ] || [ -z "$WHO_PATH" ] || [ -z "$PS_PATH" ]; then
         echo "Error: Could not find all required system commands. One or more of ss, dmesg, iptables, systemctl, journalctl, last, who, ps are missing."
         exit 1
@@ -229,9 +226,8 @@ function setup_sudoers() {
     echo "      ss: $SS_PATH"
     echo "      systemctl: $SYSTEMCTL_PATH"
     echo "      iptables: $IPTABLES_PATH"
-    echo "      ps: $PS_PATH" # NEW: Log the found path for ps
+    echo "      ps: $PS_PATH"
     
-    # NEW: Added the variable for the 'ps' command to the NOPASSWD list
     tee "$SUDOERS_FILE" > /dev/null <<SUDOERS_EOF
 # Allow noirnote-agent to run specific commands with root privileges for data collection.
 noirnote-agent ALL=(ALL) NOPASSWD: ${SS_PATH}, ${DMESG_PATH}, ${IPTABLES_PATH}, ${SYSTEMCTL_PATH}, ${JOURNALCTL_PATH}, ${LAST_PATH}, ${WHO_PATH}, ${PS_PATH}
@@ -469,6 +465,14 @@ def collect_state_snapshot(discovered_services: list):
         except Exception:
             return ""
 
+    # --- START OF FIX: Re-introduce the unprivileged command runner ---
+    def _run_command(command):
+        try:
+            return subprocess.run(command, shell=True, capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+        except Exception:
+            return ""
+    # --- END OF FIX ---
+
     def _read_pid_from_file(pid_path_pattern):
         try:
             pid_files = glob.glob(pid_path_pattern)
@@ -490,7 +494,7 @@ def collect_state_snapshot(discovered_services: list):
         for line in lines:
             if '.service' in line:
                 line_cleaned = line.strip().replace('●', '').strip()
-                parts = re.split(r'\\s+', line_cleaned, 4)
+                parts = re.split(r'\s+', line_cleaned, 4)
                 if len(parts) >= 4:
                     services.append({"unit": parts[0], "load": parts[1], "active": parts[2], "sub": parts[3], "description": parts[4] if len(parts) > 4 else ""})
         return services
@@ -522,7 +526,7 @@ def collect_state_snapshot(discovered_services: list):
 
     def get_structured_dmesg():
         output = _run_privileged_command("dmesg -T")
-        pattern = re.compile(r'\[\\s*([^\]]+)\]\\s*(.*)')
+        pattern = re.compile(r'\[\s*([^\]]+)\]\s*(.*)')
         return [{"timestamp": m.group(1).strip(), "message": m.group(2).strip()} for line in output.splitlines() if (m := pattern.match(line))]
 
     def get_ss_listeners():
@@ -531,8 +535,10 @@ def collect_state_snapshot(discovered_services: list):
         for line in output.splitlines()[1:]:
             try:
                 parts = line.split()
-                # The 'users:' part is only shown with sufficient privileges
-                match = re.search(r'users:\\(\\("([^"]+)",pid=(\\d+),', parts[-1])
+                # --- START OF FIX: Corrected Regex Pattern ---
+                # The original had too many backslashes for a standard python string.
+                match = re.search(r'users:\(\("([^"]+)",pid=(\d+),', parts[-1])
+                # --- END OF FIX ---
                 proc_name, pid = (match.group(1), int(match.group(2))) if match else (None, None)
                 listeners.append({"protocol": parts[0], "state": parts[1], "local_address": parts[4], "process_name": proc_name, "pid": pid})
             except (IndexError, ValueError): continue
@@ -541,7 +547,7 @@ def collect_state_snapshot(discovered_services: list):
     def get_version_info(command):
         # Version commands are typically safe and don't require sudo
         raw = _run_command(command.replace("sudo ", "")) # Ensure no sudo for version checks
-        match = re.search(r'(\\d+\\.\\d+\\.\\d+)', raw)
+        match = re.search(r'(\d+\.\d+\.\d+)', raw)
         return {"version": match.group(1) if match else None, "raw": raw}
 
     # Main snapshot dictionary construction
