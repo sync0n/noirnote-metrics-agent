@@ -217,9 +217,11 @@ function setup_sudoers() {
     JOURNALCTL_PATH=$(command -v journalctl)
     LAST_PATH=$(command -v last)
     WHO_PATH=$(command -v who)
-    
-    if [ -z "$SS_PATH" ] || [ -z "$DMESG_PATH" ] || [ -z "$IPTABLES_PATH" ] || [ -z "$SYSTEMCTL_PATH" ] || [ -z "$JOURNALCTL_PATH" ] || [ -z "$LAST_PATH" ] || [ -z "$WHO_PATH" ]; then
-        echo "Error: Could not find all required system commands. One or more of ss, dmesg, iptables, systemctl, journalctl, last, who are missing."
+    PS_PATH=$(command -v ps) # NEW: Find the path for 'ps'
+
+    # NEW: Added PS_PATH to the check
+    if [ -z "$SS_PATH" ] || [ -z "$DMESG_PATH" ] || [ -z "$IPTABLES_PATH" ] || [ -z "$SYSTEMCTL_PATH" ] || [ -z "$JOURNALCTL_PATH" ] || [ -z "$LAST_PATH" ] || [ -z "$WHO_PATH" ] || [ -z "$PS_PATH" ]; then
+        echo "Error: Could not find all required system commands. One or more of ss, dmesg, iptables, systemctl, journalctl, last, who, ps are missing."
         exit 1
     fi
     
@@ -227,10 +229,12 @@ function setup_sudoers() {
     echo "      ss: $SS_PATH"
     echo "      systemctl: $SYSTEMCTL_PATH"
     echo "      iptables: $IPTABLES_PATH"
+    echo "      ps: $PS_PATH" # NEW: Log the found path for ps
     
+    # NEW: Added the variable for the 'ps' command to the NOPASSWD list
     tee "$SUDOERS_FILE" > /dev/null <<SUDOERS_EOF
 # Allow noirnote-agent to run specific commands with root privileges for data collection.
-noirnote-agent ALL=(ALL) NOPASSWD: ${SS_PATH}, ${DMESG_PATH}, ${IPTABLES_PATH}, ${SYSTEMCTL_PATH}, ${JOURNALCTL_PATH}, ${LAST_PATH}, ${WHO_PATH}
+noirnote-agent ALL=(ALL) NOPASSWD: ${SS_PATH}, ${DMESG_PATH}, ${IPTABLES_PATH}, ${SYSTEMCTL_PATH}, ${JOURNALCTL_PATH}, ${LAST_PATH}, ${WHO_PATH}, ${PS_PATH}
 SUDOERS_EOF
 
     chmod 440 "$SUDOERS_FILE"
@@ -455,92 +459,92 @@ def load_user_integrations():
     except (IOError, PermissionError): return empty_integrations
     return integrations
 
-def _run_command(command):
-    try:
-        # If the command is one we have sudo privileges for, use sudo.
-        sudo_commands = ["ss", "dmesg", "iptables", "systemctl", "journalctl", "last", "who"]
-        if any(cmd in command for cmd in sudo_commands):
-            command = "sudo " + command
-        return subprocess.run(command, shell=True, capture_output=True, text=True, timeout=20, check=False).stdout.strip()
-    except Exception: return ""
-
-def _read_pid_from_file(pid_path_pattern):
-    try:
-        pid_files = glob.glob(pid_path_pattern)
-        if not pid_files: return None
-        with open(pid_files[0], 'r') as f: return int(f.read().strip())
-    except (IOError, PermissionError, ValueError, IndexError): return None
-
-def get_firewall_rules():
-    output = _run_command("iptables -S")
-    return [line for line in output.splitlines() if line.strip() and not line.startswith('#')]
-
-def get_systemd_services():
-    output = _run_command("systemctl list-units --type=service --all --no-pager")
-    services = []
-    lines = output.splitlines()
-    if lines and 'UNIT' in lines[0]:
-        lines = lines[1:] # Skip header
-    for line in lines:
-        if '.service' in line:
-            # Handle potential empty lines from systemctl output
-            line_cleaned = line.strip().replace('●', '').strip()
-            parts = re.split(r'\s+', line_cleaned, 4)
-            if len(parts) >= 4:
-                services.append({"unit": parts[0], "load": parts[1], "active": parts[2], "sub": parts[3], "description": parts[4] if len(parts) > 4 else ""})
-    return services
-
-def get_system_logs():
-    output = _run_command("journalctl -n 100 --no-pager --priority=err..warning")
-    return output.splitlines()
-
-def get_active_connections():
-    output = _run_command("ss -tuna")
-    connections = []
-    # Skip the header line
-    for line in output.splitlines()[1:]:
-        try:
-            parts = line.split()
-            # Netid, State, Recv-Q, Send-Q, Local Address:Port, Peer Address:Port
-            if len(parts) >= 6:
-                 connections.append({"protocol": parts[0], "state": parts[1], "local_address": parts[4], "peer_address": parts[5]})
-        except IndexError:
-            continue
-    return connections
-
-def get_recent_logins():
-    return _run_command("last -n 20").splitlines()
-
-def get_active_sessions():
-    return _run_command("who").splitlines()
-
-def get_failed_logins():
-    # A more robust grep that finds the common failure messages
-    return _run_command("journalctl _COMM=sshd --no-pager -n 50 | grep -E 'Failed|failure'").splitlines()
-
-def get_structured_dmesg():
-    output = _run_command("dmesg -T")
-    pattern = re.compile(r'\[\s*([^\]]+)\]\s*(.*)')
-    return [{"timestamp": m.group(1).strip(), "message": m.group(2).strip()} for line in output.splitlines() if (m := pattern.match(line))]
-
-def get_ss_listeners():
-    output = _run_command("ss -tulpn")
-    listeners = []
-    for line in output.splitlines()[1:]:
-        try:
-            parts = line.split()
-            match = re.search(r'users:\(\("([^"]+)",pid=(\d+),', parts[-1])
-            proc_name, pid = (match.group(1), int(match.group(2))) if match else (None, None)
-            listeners.append({"protocol": parts[0], "state": parts[1], "local_address": parts[4], "process_name": proc_name, "pid": pid})
-        except (IndexError, ValueError): continue
-    return listeners
-
-def get_version_info(command):
-    raw = _run_command(command)
-    match = re.search(r'(\d+\.\d+\.\d+)', raw)
-    return {"version": match.group(1) if match else None, "raw": raw}
-
 def collect_state_snapshot(discovered_services: list):
+    # This helper now prepends sudo to all commands for full visibility.
+    def _run_privileged_command(command):
+        try:
+            # All diagnostic commands will now run with elevated privileges
+            full_command = f"sudo {command}"
+            return subprocess.run(full_command, shell=True, capture_output=True, text=True, timeout=20, check=False).stdout.strip()
+        except Exception:
+            return ""
+
+    def _read_pid_from_file(pid_path_pattern):
+        try:
+            pid_files = glob.glob(pid_path_pattern)
+            if not pid_files: return None
+            with open(pid_files[0], 'r') as f: return int(f.read().strip())
+        except (IOError, PermissionError, ValueError, IndexError): return None
+
+    # Helper functions now use the new privileged command runner
+    def get_firewall_rules():
+        output = _run_privileged_command("iptables -S")
+        return [line for line in output.splitlines() if line.strip() and not line.startswith('#')]
+
+    def get_systemd_services():
+        output = _run_privileged_command("systemctl list-units --type=service --all --no-pager")
+        services = []
+        lines = output.splitlines()
+        if lines and 'UNIT' in lines[0]:
+            lines = lines[1:]
+        for line in lines:
+            if '.service' in line:
+                line_cleaned = line.strip().replace('●', '').strip()
+                parts = re.split(r'\\s+', line_cleaned, 4)
+                if len(parts) >= 4:
+                    services.append({"unit": parts[0], "load": parts[1], "active": parts[2], "sub": parts[3], "description": parts[4] if len(parts) > 4 else ""})
+        return services
+
+    def get_system_logs():
+        output = _run_privileged_command("journalctl -n 100 --no-pager --priority=err..warning")
+        return output.splitlines()
+
+    def get_active_connections():
+        output = _run_privileged_command("ss -tuna")
+        connections = []
+        for line in output.splitlines()[1:]:
+            try:
+                parts = line.split()
+                if len(parts) >= 6:
+                     connections.append({"protocol": parts[0], "state": parts[1], "local_address": parts[4], "peer_address": parts[5]})
+            except IndexError:
+                continue
+        return connections
+
+    def get_recent_logins():
+        return _run_privileged_command("last -n 20").splitlines()
+
+    def get_active_sessions():
+        return _run_privileged_command("who").splitlines()
+
+    def get_failed_logins():
+        return _run_privileged_command("journalctl _COMM=sshd --no-pager -n 50 | grep -E 'Failed|failure'").splitlines()
+
+    def get_structured_dmesg():
+        output = _run_privileged_command("dmesg -T")
+        pattern = re.compile(r'\[\\s*([^\]]+)\]\\s*(.*)')
+        return [{"timestamp": m.group(1).strip(), "message": m.group(2).strip()} for line in output.splitlines() if (m := pattern.match(line))]
+
+    def get_ss_listeners():
+        output = _run_privileged_command("ss -tulpn")
+        listeners = []
+        for line in output.splitlines()[1:]:
+            try:
+                parts = line.split()
+                # The 'users:' part is only shown with sufficient privileges
+                match = re.search(r'users:\\(\\("([^"]+)",pid=(\\d+),', parts[-1])
+                proc_name, pid = (match.group(1), int(match.group(2))) if match else (None, None)
+                listeners.append({"protocol": parts[0], "state": parts[1], "local_address": parts[4], "process_name": proc_name, "pid": pid})
+            except (IndexError, ValueError): continue
+        return listeners
+    
+    def get_version_info(command):
+        # Version commands are typically safe and don't require sudo
+        raw = _run_command(command.replace("sudo ", "")) # Ensure no sudo for version checks
+        match = re.search(r'(\\d+\\.\\d+\\.\\d+)', raw)
+        return {"version": match.group(1) if match else None, "raw": raw}
+
+    # Main snapshot dictionary construction
     snapshot = {
         'dmesg_events': get_structured_dmesg(),
         'network_listeners': get_ss_listeners(),
@@ -605,12 +609,41 @@ def collect_all_metrics():
     net, disk = psutil.net_io_counters(), psutil.disk_io_counters()
     
     procs, services = [], set()
-    for p in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent', 'memory_percent', 'cmdline']):
-        try:
-            info = p.info
-            procs.append(info)
-            if info['name'] in INTEGRATION_KNOWLEDGE_MAP: services.add(info['name'])
-        except (psutil.NoSuchProcess, psutil.AccessDenied): continue
+    try:
+        # Use sudo to run 'ps' and get a complete process list, including full command paths.
+        # The output format is: PID<SEP>USERNAME<SEP>CPU%<SEP>MEM%<SEP>COMMAND
+        ps_command = "sudo ps -eo pid,user,%cpu,%mem,cmd --sort=-%cpu --no-headers"
+        ps_output = subprocess.run(ps_command, shell=True, capture_output=True, text=True, timeout=15, check=False).stdout
+        
+        for line in ps_output.strip().splitlines():
+            try:
+                parts = line.strip().split(maxsplit=4)
+                if len(parts) == 5:
+                    pid, user, cpu, mem, cmd = parts
+                    # Get just the process name from the full command for service discovery
+                    process_name = os.path.basename(cmd.split()[0])
+                    
+                    procs.append({
+                        'pid': int(pid),
+                        'name': process_name,
+                        'username': user,
+                        'cpu_percent': float(cpu),
+                        'memory_percent': float(mem),
+                        'cmdline': cmd
+                    })
+                    if process_name in INTEGRATION_KNOWLEDGE_MAP:
+                        services.add(process_name)
+            except (ValueError, IndexError):
+                continue # Skip malformed lines
+    except Exception as e:
+        # Fallback to psutil if the sudo command fails for any reason
+        print(f"WARNING: Sudo 'ps' command failed ({e}). Falling back to unprivileged psutil scan.")
+        for p in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent', 'memory_percent', 'cmdline']):
+            try:
+                info = p.info
+                procs.append(info)
+                if info['name'] in INTEGRATION_KNOWLEDGE_MAP: services.add(info['name'])
+            except (psutil.NoSuchProcess, psutil.AccessDenied): continue
 
     tcp_states = {"ESTABLISHED": 0, "TIME_WAIT": 0, "CLOSE_WAIT": 0}
     try:
@@ -629,7 +662,7 @@ def collect_all_metrics():
         "disk_io": {"reads_per_sec": (disk.read_count - last_disk_io.read_count) / elapsed, "writes_per_sec": (disk.write_count - last_disk_io.write_count) / elapsed},
         "disks": [{"device": p.device, "mountpoint": p.mountpoint, "percent": psutil.disk_usage(p.mountpoint).percent} for p in psutil.disk_partitions(all=False) if 'loop' not in p.device],
         "network": {"sent_per_sec": (net.bytes_sent - last_net_io.bytes_sent) / elapsed, "recv_per_sec": (net.bytes_recv - last_net_io.bytes_recv) / elapsed, "tcp_connections": tcp_states},
-        "processes": sorted(procs, key=lambda p: (p.get('cpu_percent', 0) or 0), reverse=True)[:15],
+        "processes": procs, # Use the new, complete process list
     }
     last_net_io, last_disk_io, last_time = net, disk, now
     return metrics, list(services)
