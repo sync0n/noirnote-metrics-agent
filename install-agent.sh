@@ -173,7 +173,8 @@ YUM_REPO_EOF
     fi
     
     echo "    - Installing Python packages into virtual environment..."
-    if ! "${AGENT_DIR}/venv/bin/pip" install psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 pycryptodome==3.20.0 > /dev/null; then
+    # FIX: Added cryptography==42.0.5 to allow local decryption of the handshake
+    if ! "${AGENT_DIR}/venv/bin/pip" install psutil==5.9.8 requests==2.32.3 google-auth==2.28.2 pycryptodome==3.20.0 cryptography==42.0.5 > /dev/null; then
         echo "Error: Failed to install Python dependencies"
         exit 1
     fi
@@ -760,17 +761,29 @@ AGENT_EOF
 function configure_agent() {
     echo "--> [8/9] Configuring agent..."
     TOKEN=""
+    SECRET=""
+    
+    # Parse arguments
     for arg in "$@"; do
-        if [[ $arg == --token=* ]]; then TOKEN="${arg#*=}"; shift; fi
+        if [[ $arg == --token=* ]]; then TOKEN="${arg#*=}"; fi
+        if [[ $arg == --secret=* ]]; then SECRET="${arg#*=}"; fi
     done
 
     if [ -f "$CONFIG_FILE_PATH" ] && [ -f "$KEY_FILE_PATH" ] && [ -z "$TOKEN" ]; then
         echo "    - Configuration files already exist. Skipping."
         return
     fi
+    
     if [ -z "$TOKEN" ]; then
         echo "    [ERROR] --token flag is required for initial configuration."
-        echo "    Usage: $0 --token=YOUR_AGENT_TOKEN"
+        echo "    Usage: $0 --token=YOUR_AGENT_TOKEN --secret=YOUR_HANDSHAKE_SECRET"
+        exit 1
+    fi
+    
+    # E2EE Fix: Secret is now required for decryption
+    if [ -z "$SECRET" ]; then
+        echo "    [ERROR] --secret flag is required for End-to-End Encryption."
+        echo "    The dashboard should have provided this in the install command."
         exit 1
     fi
 
@@ -788,14 +801,26 @@ function configure_agent() {
     fi
 
     echo "    - Processing claim response..."
+    # Helper to extract JSON fields using python
     SERVICE_ACCOUNT_KEY_JSON=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.dumps(json.load(sys.stdin).get('serviceAccountKey'), indent=2))" 2>/dev/null)
     USER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('userId', ''))" 2>/dev/null)
     SERVER_ID=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('serverId', ''))" 2>/dev/null)
-    CHRONOS_KEY=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('chronosKey', ''))" 2>/dev/null)
     
-    if [ -z "$SERVICE_ACCOUNT_KEY_JSON" ] || [ -z "$USER_ID" ] || [ -z "$SERVER_ID" ] || [ -z "$CHRONOS_KEY" ]; then
+    # This is now the ENCRYPTED blob from the server
+    ENCRYPTED_BLOB=$(echo "$RESPONSE_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('chronosKey', ''))" 2>/dev/null)
+    
+    if [ -z "$SERVICE_ACCOUNT_KEY_JSON" ] || [ -z "$USER_ID" ] || [ -z "$SERVER_ID" ] || [ -z "$ENCRYPTED_BLOB" ]; then
         echo "    [ERROR] Claim response was incomplete or malformed."
         echo "    Please check your token and try again."
+        exit 1
+    fi
+
+    echo "    - Decrypting metric key (E2EE Handshake)..."
+    # Use the virtual environment's python (which has cryptography installed) to decrypt the blob using the secret
+    CHRONOS_KEY=$("${AGENT_DIR}/venv/bin/python3" -c "from cryptography.fernet import Fernet; print(Fernet(b'$SECRET').decrypt(b'$ENCRYPTED_BLOB').decode())" 2>/dev/null)
+
+    if [ -z "$CHRONOS_KEY" ]; then
+        echo "    [ERROR] Failed to decrypt the metric key. The handshake secret may be invalid."
         exit 1
     fi
     
@@ -805,6 +830,7 @@ function configure_agent() {
     chmod 400 "$KEY_FILE_PATH"
 
     echo "    - Creating agent configuration..."
+    # Write the DECRYPTED key to the config file so the python agent can use it normally
     tee "$CONFIG_FILE_PATH" > /dev/null <<EOF
 SERVER_ID=$SERVER_ID
 USER_ID=$USER_ID
